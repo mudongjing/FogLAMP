@@ -229,6 +229,12 @@ class ConfigurationManager(ConfigurationManagerSingleton):
                 if type(entry_name) is not str:
                     raise TypeError('entry_name must be a string for item_name {}'.format(item_name))
 
+                # Validate script type and file attribute is update into expected_item_entries
+                if 'type' in item_val and get_entry_val("type") == 'script':
+                    if entry_name == 'file':
+                        d = {entry_name: entry_val}
+                        expected_item_entries.update(d)
+
                 # Validate enumeration type and mandatory options item_name
                 if 'type' in item_val and get_entry_val("type") == 'enumeration':
                     if 'options' not in item_val:

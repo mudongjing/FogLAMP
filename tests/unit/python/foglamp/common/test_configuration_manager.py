@@ -263,6 +263,44 @@ class TestConfigurationManager:
         assert test_item_val.get("value") is "test value val"
 
     @pytest.mark.asyncio
+    async def test__validate_category_script_type_and_use_default_val(self, reset_singleton):
+        storage_client_mock = MagicMock(spec=StorageClientAsync)
+        c_mgr = ConfigurationManager(storage_client_mock)
+        test_config = {
+            "test_item_name": {
+                "description": "test description val",
+                "type": "script",
+                "default": "",
+                "file": "/home/foglamp/data/scripts/sine_script_readings35.py"
+            },
+        }
+        c_return_value = await c_mgr._validate_category_val(category_val=test_config,
+                                                            set_value_val_from_default_val=True)
+        assert isinstance(c_return_value, dict)
+        assert 1 == len(c_return_value)
+        test_item_val = c_return_value.get("test_item_name")
+        assert isinstance(test_item_val, dict)
+        assert 5 == len(test_item_val)
+        assert "test description val" == test_item_val.get("description")
+        assert "script" == test_item_val.get("type")
+        assert "" == test_item_val.get("default")
+        assert "" == test_item_val.get("value")
+        assert "/home/foglamp/data/scripts/sine_script_readings35.py" == test_item_val.get("file")
+
+        # deep copy check to make sure test_config wasn't modified in the
+        # method call
+        assert test_config is not c_return_value
+        assert isinstance(test_config, dict)
+        assert 1 == len(test_config)
+        test_item_val = test_config.get("test_item_name")
+        assert isinstance(test_item_val, dict)
+        assert 4 == len(test_item_val)
+        assert "test description val" == test_item_val.get("description")
+        assert "script" == test_item_val.get("type")
+        assert "" == test_item_val.get("default")
+        assert "/home/foglamp/data/scripts/sine_script_readings35.py" == test_item_val.get("file")
+
+    @pytest.mark.asyncio
     async def test__validate_category_optional_attributes_and_use_value(self, reset_singleton):
         storage_client_mock = MagicMock(spec=StorageClientAsync)
         c_mgr = ConfigurationManager(storage_client_mock)
@@ -563,7 +601,8 @@ class TestConfigurationManager:
         ("IPv6", "2001:db8::", "2001:db8::"),
         ("password", "not implemented", "not implemented"),
         ("X509 certificate", "not implemented", "not implemented"),
-        ("JSON", "{\"foo\": \"bar\"}", '{"foo": "bar"}')
+        ("JSON", "{\"foo\": \"bar\"}", '{"foo": "bar"}'),
+        ("script", "", "")
     ])
     @pytest.mark.asyncio
     async def test__validate_category_val_valid_type(self, reset_singleton, test_input, test_value, clean_value):
