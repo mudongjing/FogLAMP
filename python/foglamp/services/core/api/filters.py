@@ -451,6 +451,8 @@ def _delete_keys_from_dict(dict_del: Dict, lst_keys: List[str], deleted_values: 
             if parent is not None:
                 if dict_del['type'] == 'JSON':
                     i_val = json.loads(dict_del[k]) if isinstance(dict_del[k], str) else json.loads(json.dumps(dict_del[k]))
+                elif dict_del['type'] == 'script':
+                    i_val = ""
                 else:
                     i_val = dict_del[k]
                 deleted_values.update({parent: i_val})
@@ -484,20 +486,39 @@ async def _add_child_filters(storage: StorageClientAsync, cf_mgr: ConfigurationM
     # Create children categories. Since create_category() does not expect "value" key to be
     # present in the payload, we need to remove all "value" keys BUT need to add back these
     # "value" keys to the new configuration.
+    script_filter_config = {}
+    item_name = None
     for filter_name in filter_list:
         filter_config = await cf_mgr.get_category_all_items(category_name="{}_{}".format(user_name, filter_name))
         # If "username_filter" category does not exist
         if filter_config is None:
             filter_config = await cf_mgr.get_category_all_items(category_name=filter_name)
-
             filter_desc = "Configuration of {} filter for user {}".format(filter_name, user_name)
+            # Deep copy only script type filter config
+            for i, k in filter_config.items():
+                if k['type'] == 'script':
+                    script_filter_config = copy.deepcopy(filter_config[i])
+                    item_name = i
+                    break
+
             new_filter_config, deleted_values = _delete_keys_from_dict(filter_config, ['value'], deleted_values={}, parent=None)
             await cf_mgr.create_category(category_name="{}_{}".format(user_name, filter_name),
                                          category_description=filter_desc,
                                          category_value=new_filter_config,
                                          keep_original_items=True)
+
+            filter_cat_in_pipeline = "{}_{}".format(user_name, filter_name)
             if deleted_values != {}:
-                await cf_mgr.update_configuration_item_bulk("{}_{}".format(user_name, filter_name), deleted_values)
+                await cf_mgr.update_configuration_item_bulk(filter_cat_in_pipeline, deleted_values)
+            # Special case to handle script type
+            if script_filter_config:
+                import binascii
+                hex_data = binascii.hexlify(script_filter_config['value'].encode('utf-8')).decode('utf-8')
+                # Remove cat from cache
+                if filter_cat_in_pipeline in cf_mgr._cacheManager.cache:
+                    cf_mgr._cacheManager.remove(filter_cat_in_pipeline)
+
+                await cf_mgr.set_category_item_value_entry(filter_cat_in_pipeline, item_name, hex_data, script_filter_config['file'])
 
         # Remove cat from cache
         if filter_name in cf_mgr._cacheManager.cache:
