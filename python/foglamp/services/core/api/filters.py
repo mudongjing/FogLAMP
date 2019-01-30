@@ -451,6 +451,7 @@ def _delete_keys_from_dict(dict_del: Dict, lst_keys: List[str], deleted_values: 
             if parent is not None:
                 if dict_del['type'] == 'JSON':
                     i_val = json.loads(dict_del[k]) if isinstance(dict_del[k], str) else json.loads(json.dumps(dict_del[k]))
+                # script type always have empty value by default when new category; use upload endpoint to save actual value later
                 elif dict_del['type'] == 'script':
                     i_val = ""
                 else:
