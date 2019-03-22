@@ -106,6 +106,8 @@ class TestE2EKafka:
                 on endpoint GET /foglamp/asset/<asset_name>
                 data received from Kafka is same as data sent"""
 
+        self._clean_kafka_instance(kafka_host, kafka_rest_port)
+
         conn = http.client.HTTPConnection(foglamp_url)
         time.sleep(wait_time)
         subprocess.run(["cd $FOGLAMP_ROOT/extras/python; python3 -m fogbench -t ../../data/{}; cd -"
@@ -142,7 +144,6 @@ class TestE2EKafka:
         get_ping_status()
 
         self._read_from_kafka(kafka_host, kafka_rest_port, kafka_topic, wait_time)
-        self._clean_kafka_instance(kafka_host, kafka_rest_port)
 
     def _clean_kafka_instance(self, kafka_host, kafka_rest_port):
         """  Close the consumer (DELETE) to make it leave the group and clean up its resources
