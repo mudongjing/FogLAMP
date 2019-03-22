@@ -152,22 +152,18 @@ class TestE2EKafka:
         self._close_consumer(kafka_host, kafka_rest_port)
 
     def _read_from_kafka(self, host, rest_port, topic, wait_time):
-        conn = http.client.HTTPConnection("{}:{}".format(host, rest_port))
-
-        # Assertions on Kafka topic, consumer and subscription
-        self._verify_kafka_topic(conn, topic)
-
-        self._verify_kafka_topic_by_name(conn, topic)
-
-        # Create a consumer group and instance
-        self._verify_kafka_consumer_group_and_instance(conn)
-
-        self._verify_consumer_subscription_to_topic(conn, topic)
-
-        time.sleep(wait_time)
-        self._verify_consumer_data_from_topic(conn)
 
         self._clean_kafka_instance(host, rest_port)
+
+        conn = http.client.HTTPConnection("{}:{}".format(host, rest_port))
+        # Assertions on Kafka topic, consumer and subscription
+        self._verify_kafka_topic(conn, topic)
+        self._verify_kafka_topic_by_name(conn, topic)
+        # Create a consumer group and instance
+        self._verify_kafka_consumer_group_and_instance(conn)
+        self._verify_consumer_subscription_to_topic(conn, topic)
+        time.sleep(wait_time)
+        self._verify_consumer_data_from_topic(conn)
 
     def _verify_kafka_topic(self, conn, topic):
         conn.request("GET", '/topics')
