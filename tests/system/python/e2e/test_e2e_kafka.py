@@ -128,13 +128,32 @@ class TestE2EKafka:
         assert 1 == len(val)
         assert {'sensor': SENSOR_VALUE} == val[0]["reading"]
 
-        self._read_from_kafka(kafka_host, kafka_rest_port, kafka_topic)
+        def get_ping_status():
+            _connection = http.client.HTTPConnection(foglamp_url)
+            _connection.request("GET", '/foglamp/ping')
+            cr = _connection.getresponse()
+            assert 200 == cr.status
+            res = cr.read().decode()
+            jdoc = json.loads(res)
+            assert len(jdoc)
+            assert 1 == jdoc['dataSent']
+            assert 1 == jdoc['dataRead']
 
-    def _read_from_kafka(self, host, rest_port, topic):
+        get_ping_status()
+
+        self._read_from_kafka(kafka_host, kafka_rest_port, kafka_topic, wait_time)
+        self._clean_kafka_instance(kafka_host, kafka_rest_port)
+
+    def _clean_kafka_instance(self, kafka_host, kafka_rest_port):
+        """  Close the consumer (DELETE) to make it leave the group and clean up its resources
+        :param kafka_host:
+        :param kafka_rest_port:
+        :return:
+        """
+        self._close_consumer(kafka_host, kafka_rest_port)
+
+    def _read_from_kafka(self, host, rest_port, topic, wait_time):
         conn = http.client.HTTPConnection("{}:{}".format(host, rest_port))
-
-        # Close the consumer (DELETE) to make it leave the group and clean up its resources
-        self._close_consumer(host, rest_port)
 
         # Assertions on Kafka topic, consumer and subscription
         self._verify_kafka_topic(conn, topic)
@@ -146,7 +165,7 @@ class TestE2EKafka:
 
         self._verify_consumer_subscription_to_topic(conn, topic)
 
-        # FIXME: FOGL-2573 local / AWS confluent setup results in no data
+        time.sleep(wait_time)
         self._verify_consumer_data_from_topic(conn)
 
     def _verify_kafka_topic(self, conn, topic):
@@ -200,3 +219,4 @@ class TestE2EKafka:
         r = conn.getresponse()
         # No content response
         r.read()
+        assert r.status
