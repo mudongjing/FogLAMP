@@ -11,12 +11,12 @@
 #include <connection.h>
 
 
-MemConnectionManager *MemConnectionManager::instance = 0;
+ConnectionManager *ConnectionManager::instance = 0;
 
 /**
  * Default constructor for the connection manager.
  */
-MemConnectionManager::MemConnectionManager()
+ConnectionManager::ConnectionManager()
 {
 	lastError.message = NULL;
 	lastError.entryPoint = NULL;
@@ -30,7 +30,7 @@ MemConnectionManager::MemConnectionManager()
  * Called at shutdown. Shrink the idle pool, this will
  * have the side effect of closing the connections to the database.
  */
-void MemConnectionManager::shutdown()
+void ConnectionManager::shutdown()
 {
 	shrinkPool(idle.size());
 }
@@ -39,11 +39,11 @@ void MemConnectionManager::shutdown()
  * Return the singleton instance of the connection manager.
  * if none was created then create it.
  */
-MemConnectionManager *MemConnectionManager::getInstance()
+ConnectionManager *ConnectionManager::getInstance()
 {
 	if (instance == 0)
 	{
-		instance = new MemConnectionManager();
+		instance = new ConnectionManager();
 	}
 	return instance;
 }
@@ -54,12 +54,13 @@ MemConnectionManager *MemConnectionManager::getInstance()
  *
  * @param delta	The number of connections to add to the pool
  */
-void MemConnectionManager::growPool(unsigned int delta)
+void ConnectionManager::growPool(unsigned int delta)
 {
 	while (delta-- > 0)
 	{
 		Connection *conn = new Connection();
-		conn->setTrace(m_trace);
+		if (m_trace)
+			conn->setTrace(true);
 		idleLock.lock();
 		idle.push_back(conn);
 		idleLock.unlock();
@@ -72,7 +73,7 @@ void MemConnectionManager::growPool(unsigned int delta)
  * @param delta		Number of connections to attempt to remove
  * @return The number of connections removed.
  */
-unsigned int MemConnectionManager::shrinkPool(unsigned int delta)
+unsigned int ConnectionManager::shrinkPool(unsigned int delta)
 {
 unsigned int removed = 0;
 Connection   *conn;
@@ -100,7 +101,7 @@ Connection   *conn;
  * Allocate a connection from the idle pool. If
  * no connection is available add a new connection
  */
-Connection *MemConnectionManager::allocate()
+Connection *ConnectionManager::allocate()
 {
 Connection *conn = 0;
 
@@ -130,7 +131,7 @@ Connection *conn = 0;
  *
  * @param conn	The connection to release.
  */
-void MemConnectionManager::release(Connection *conn)
+void ConnectionManager::release(Connection *conn)
 {
 	inUseLock.lock();
 	inUse.remove(conn);
@@ -147,7 +148,7 @@ void MemConnectionManager::release(Connection *conn)
  * @param description	The error description
  * @param retryable	Flag to determien if the error condition is transient
  */
-void MemConnectionManager::setError(const char *source, const char *description, bool retryable)
+void ConnectionManager::setError(const char *source, const char *description, bool retryable)
 {
 	errorLock.lock();
 	if (lastError.entryPoint)

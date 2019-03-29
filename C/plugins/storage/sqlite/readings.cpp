@@ -1,7 +1,7 @@
 /*
  * FogLAMP storage service.
  *
- * Copyright (c) 2018 OSisoft, LLC
+ * Copyright (c) 2018 OSIsoft, LLC
  *
  * Released under the Apache 2.0 Licence
  *
@@ -9,22 +9,28 @@
  */
 #include <connection.h>
 #include <connection_manager.h>
-#include <sql_buffer.h>
-#include <iostream>
-#include <sqlite3.h>
-#include "rapidjson/document.h"
-#include "rapidjson/writer.h"
-#include "rapidjson/stringbuffer.h"
-#include "rapidjson/error/error.h"
-#include "rapidjson/error/en.h"
-#include <string>
-#include <map>
-#include <stdarg.h>
-#include <stdlib.h>
-#include <sstream>
-#include <logger.h>
-#include <time.h>
-#include <unistd.h>
+#include <common.h>
+
+/*
+ * Control the way purge deletes readings. The block size sets a limit as to how many rows
+ * get deleted in each call, whilst the sleep interval controls how long the thread sleeps
+ * between deletes. The idea is to not keep the database locked too long and allow other threads
+ * to have access to the database between blocks.
+ */
+#define PURGE_SLEEP_MS 500
+#define PURGE_DELETE_BLOCK_SIZE	20
+#define TARGET_PURGE_BLOCK_DEL_TIME	(70*1000) 	// 70 msec
+#define PURGE_BLOCK_SZ_GRANULARITY	5 	// 5 rows
+#define MIN_PURGE_DELETE_BLOCK_SIZE	20
+#define MAX_PURGE_DELETE_BLOCK_SIZE	1500
+#define RECALC_PURGE_BLOCK_SIZE_NUM_BLOCKS	30	// recalculate purge block size after every 30 blocks
+
+#define PURGE_SLOWDOWN_AFTER_BLOCKS 5
+#define PURGE_SLOWDOWN_SLEEP_MS 500
+
+#ifndef PLUGIN_LOG_NAME
+#define PLUGIN_LOG_NAME "SQLite 3"
+#endif
 
 /**
  * SQLite3 storage plugin for FogLAMP
@@ -35,67 +41,41 @@ using namespace rapidjson;
 
 #define CONNECT_ERROR_THRESHOLD		5*60	// 5 minutes
 
-#define MAX_RETRIES			10	// Maximum no. of retries for a DB lock
+#define MAX_RETRIES			40	// Maximum no. of retries when a lock is encountered
+#define RETRY_BACKOFF			100	// Multipler to backoff DB retry on lock
+
+/*
+ * The following allows for conditional inclusion of code that tracks the top queries
+ * run by the storage plugin and the number of times a particular statement has to
+ * be retried because of the database being busy./
+ */
+#define DO_PROFILE		0
+#define DO_PROFILE_RETRIES	0
+#if DO_PROFILE
+#include <profile.h>
+
+#define	TOP_N_STATEMENTS		10	// Number of statements to report in top n
+#define RETRY_REPORT_THRESHOLD		1000	// Report retry statistics every X calls
+
+QueryProfile profiler(TOP_N_STATEMENTS);
+unsigned long retryStats[MAX_RETRIES] = { 0,0,0,0,0,0,0,0,0,0 };
+unsigned long numStatements = 0;
+int	      maxQueue = 0;
+#endif
+
+static std::atomic<int> m_waiting(0);
+static std::atomic<int> m_writeAccessOngoing(0);
+static std::mutex	db_mutex;
+static std::condition_variable	db_cv;
+static int purgeBlockSize = PURGE_DELETE_BLOCK_SIZE;
+
+#define START_TIME std::chrono::high_resolution_clock::time_point t1 = std::chrono::high_resolution_clock::now();
+#define END_TIME std::chrono::high_resolution_clock::time_point t2 = std::chrono::high_resolution_clock::now(); \
+				 auto usecs = std::chrono::duration_cast<std::chrono::microseconds>( t2 - t1 ).count();
 
 #define _DB_NAME              "/foglamp.sqlite"
 
-#define LEN_BUFFER_DATE 100
-#define F_TIMEH24_S     	"%H:%M:%S"
-#define F_DATEH24_S     	"%Y-%m-%d %H:%M:%S"
-#define F_DATEH24_M     	"%Y-%m-%d %H:%M"
-#define F_DATEH24_H     	"%Y-%m-%d %H"
-// This is the default datetime format in FogLAMP: 2018-05-03 18:15:00.622
-#define F_DATEH24_MS    	"%Y-%m-%d %H:%M:%f"
-// Format up to seconds
-#define F_DATEH24_SEC    	"%Y-%m-%d %H:%M:%S"
-#define SQLITE3_NOW     	"strftime('%Y-%m-%d %H:%M:%f', 'now', 'localtime')"
-// The default precision is milliseconds, it adds microseconds and timezone
-#define SQLITE3_NOW_READING     "strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"
-#define SQLITE3_FOGLAMP_DATETIME_TYPE "DATETIME"
 static time_t connectErrorTime = 0;
-map<string, string> sqliteDateFormat = {
-						{"HH24:MI:SS",
-							F_TIMEH24_S},
-						{"YYYY-MM-DD HH24:MI:SS.MS",
-							F_DATEH24_MS},
-						{"YYYY-MM-DD HH24:MI:SS",
-							F_DATEH24_S},
-						{"YYYY-MM-DD HH24:MI",
-							F_DATEH24_M},
-						{"YYYY-MM-DD HH24",
-							F_DATEH24_H},
-						{"", ""}
-					};
-
-/**
- * This SQLIte3 query callback returns a formatted date
- * by SELECT strftime('format', column, 'locatime')
- *
- * @param data         Output parameter to update with new datetime
- * @param nCols        The number of columns or the row
- * @param colValues    The column values
- * @param colNames     The column names
- * @return             0 on success, 1 otherwise
- */
-static int dateCallback(void *data,
-			int nCols,
-			char **colValues,
-			char **colNames)
-{
-	if (colValues[0] != NULL)
-	{
-		memcpy((char *)data,
-			colValues[0],
-			strlen(colValues[0]));
-		// OK
-		return 0;
-	}
-	else
-	{
-		// Failure
-		return 1;
-	}
-}
 
 /**
  * Apply FogLAMP default datetime formatting
@@ -152,7 +132,7 @@ bool Connection::applyColumnDateTimeFormat(sqlite3_stmt *pStmt,
 				    sqlite3_column_name(pStmt, i)) == 0))
 			{
 				const char *pzDataType;
-				int retType = sqlite3_table_column_metadata(inMemory,
+				int retType = sqlite3_table_column_metadata(dbHandle,
 									    sqlite3_column_database_name(pStmt, i),
 									    sqlite3_column_table_name(pStmt, i),
 									    sqlite3_column_name(pStmt, i),
@@ -199,7 +179,7 @@ bool Connection::applyColumnDateTimeFormat(sqlite3_stmt *pStmt,
 		char formattedData[100] = "";
 
 		// Exec the format SQL
-		int rc = SQLexec(inMemory,
+		int rc = SQLexec(dbHandle,
 				 formatStmt.c_str(),
 				 dateCallback,
 				 formattedData,
@@ -224,249 +204,6 @@ bool Connection::applyColumnDateTimeFormat(sqlite3_stmt *pStmt,
 	}
 
 	return false;
-}
-
-/**
- * Apply the specified date format
- * using the available formats in SQLite3
- * for a specific column
- *
- * If the requested format is not availble
- * the input column is used as is.
- * Additionally milliseconds could be rounded
- * upon request.
- * The routine return false if datwe format is not
- * found and the caller might decide to raise an error
- * or use the non formatted value
- *
- * @param inFormat     Input date format from application
- * @param colName      The column name to format
- * @param outFormat    The formatted column
- * @return             True if format has been applied or
- *		       false id no format is in use.
- */
-static bool applyColumnDateFormat(const string& inFormat,
-				  const string& colName,
-				  string& outFormat,
-				  bool roundMs = false)
-
-{
-bool retCode;
-	// Get format, if any, from the supported formats map
-	const string format = sqliteDateFormat[inFormat];
-	if (!format.empty())
-	{
-		// Apply found format via SQLite3 strftime()
-		outFormat.append("strftime('");
-		outFormat.append(format);
-		outFormat.append("', ");
-
-		// Check whether we have to round milliseconds
-		if (roundMs == true &&
-		    format.back() == 'f')
-		{
-			outFormat.append("cast(round((julianday(");
-			outFormat.append(colName);
-			outFormat.append(") - 2440587.5)*86400 -0.00005, 3) AS FLOAT), 'unixepoch'");
-		}
-		else
-		{
-			outFormat.append(colName);
-		}
-
-		outFormat.append(", 'localtime')");	// MR TRY THIS
-		retCode = true;
-	}
-	else
-	{
-		// Use column as is
-		outFormat.append(colName);
-		retCode = false;
-	}
-
-	return retCode;
-}
-
-/**
- * Apply the specified date format
- * using the available formats in SQLite3
- * for a specific column
- *
- * If the requested format is not availble
- * the input column is used as is.
- * Additionally milliseconds could be rounded
- * upon request.
- * The routine return false if datwe format is not
- * found and the caller might decide to raise an error
- * or use the non formatted value
- *
- * @param inFormat     Input date format from application
- * @param colName      The column name to format
- * @param outFormat    The formatted column
- * @return             True if format has been applied or
- *		       false id no format is in use.
- */
-static bool applyColumnDateFormatLocaltime(const string& inFormat,
-				  const string& colName,
-				  string& outFormat,
-				  bool roundMs = false)
-
-{
-bool retCode;
-	// Get format, if any, from the supported formats map
-	const string format = sqliteDateFormat[inFormat];
-	if (!format.empty())
-	{
-		// Apply found format via SQLite3 strftime()
-		outFormat.append("strftime('");
-		outFormat.append(format);
-		outFormat.append("', ");
-
-		// Check whether we have to round milliseconds
-		if (roundMs == true &&
-		    format.back() == 'f')
-		{
-			outFormat.append("cast(round((julianday(");
-			outFormat.append(colName);
-			outFormat.append(") - 2440587.5)*86400 -0.00005, 3) AS FLOAT), 'unixepoch'");
-		}
-		else
-		{
-			outFormat.append(colName);
-		}
-
-		outFormat.append(", 'localtime')");	// MR force localtime
-		retCode = true;
-	}
-	else
-	{
-		// Use column as is
-		outFormat.append(colName);
-		retCode = false;
-	}
-
-	return retCode;
-}
-
-/**
- * Apply the specified date format
- * using the available formats in SQLite3
- *
- * @param inFormat     Input date format from application
- * @param outFormat    The formatted column
- * @return             True if format has been applied or
- *		       false
- */
-static bool applyDateFormat(const string& inFormat,
-			    string& outFormat)
-
-{
-bool retCode;
-	// Get format, if any, from the supported formats map
-	const string format = sqliteDateFormat[inFormat];
-	if (!format.empty())
-	{
-		// Apply found format via SQLite3 strftime()
-		outFormat.append("strftime('");
-		outFormat.append(format);
-		outFormat.append("', ");
-
-		return true;
-	}
-	else
-	{
-		return false;
-	}
-}
-
-/**
- * Create a SQLite3 database connection
- */
-Connection::Connection()
-{
-	/**
-	 * Create IN MEMORY database for "readings" table: set empty file
-	 */
-	const char *inMemoryConn = "file:?cache=shared";
-
-	// UTC time as default
-	const char * createReadings = "CREATE TABLE foglamp.readings (" \
-					"id		INTEGER			PRIMARY KEY AUTOINCREMENT," \
-					"asset_code	character varying(50)	NOT NULL," \
-					"read_key	uuid			UNIQUE," \
-					"reading	JSON			NOT NULL DEFAULT '{}'," \
-					"user_ts	DATETIME 		DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f+00:00', 'NOW' ))," \
-					"ts		DATETIME 		DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f+00:00', 'NOW' ))" \
-					");";
-
-	const char * createReadingsFk = "CREATE INDEX fki_readings_fk1 ON readings (asset_code);";
-
-	const char * createReadingsIdx = "CREATE INDEX readings_ix1 ON readings (read_key);";
-
-	// Allow usage of URI for filename
-        sqlite3_config(SQLITE_CONFIG_URI, 1);
-
-	if (sqlite3_open(inMemoryConn, &inMemory) != SQLITE_OK)
-        {
-		const char* dbErrMsg = sqlite3_errmsg(inMemory);
-		const char* errMsg = "Failed to open the IN_MEMORY SQLite3 database";
-
-		Logger::getLogger()->error("%s '%s'",
-					   dbErrMsg,
-					   inMemoryConn);
-		connectErrorTime = time(0);
-
-		raiseError("InMemory Connection", "%s '%s'",
-			   dbErrMsg,
-			   inMemoryConn);
-
-		sqlite3_close_v2(inMemory);
-	}
-        else
-	{
-		Logger::getLogger()->info("Connected to IN_MEMORY SQLite3 database: %s",
-					  inMemoryConn);
-
-		int rc;
-                // Exec the statements without getting error messages, for now
-
-		// ATTACH 'foglamp' as in memory shared DB
-		rc = sqlite3_exec(inMemory,
-				  "ATTACH DATABASE 'file::memory:?cache=shared' AS 'foglamp'",
-				  NULL,
-				  NULL,
-				  NULL);
-
-		// CREATE TABLE readings
-		rc = sqlite3_exec(inMemory,
-				  createReadings,
-				  NULL,
-				  NULL,
-				  NULL);
-
-                // FK
-		rc = sqlite3_exec(inMemory,
-				  createReadingsFk,
-				  NULL,
-				  NULL,
-				  NULL);
-
-		// INDEX
-		rc = sqlite3_exec(inMemory,
-				  createReadingsIdx,
-				  NULL,
-				  NULL,
-				  NULL);
-	}
-
-}
-
-/**
- * Destructor for the database connection.
- * Close the connection to SQLite3 db
- */
-Connection::~Connection()
-{
 }
 
 /**
@@ -499,7 +236,7 @@ unsigned long nRows = 0, nCols = 0;
 	count.SetInt(0);
 
 	// Iterate over all the rows in the resultSet
-	while ((rc = sqlite3_step(pStmt)) == SQLITE_ROW)
+	while ((rc = SQLstep(pStmt)) == SQLITE_ROW)
 	{
 		// Get number of columns for current row
 		nCols = sqlite3_column_count(pStmt);
@@ -540,8 +277,16 @@ unsigned long nRows = 0, nCols = 0;
 					Value value;
 					if (!d.Parse(str).HasParseError())
 					{
-						// JSON parsing ok, use the document
-						value = Value(d, allocator);
+						if (d.IsNumber())
+						{
+							// Set string
+							value = Value(str, allocator);
+						}
+						else
+						{
+							// JSON parsing ok, use the document
+							value = Value(d, allocator);
+						}
 					}
 					else
 					{
@@ -604,509 +349,78 @@ unsigned long nRows = 0, nCols = 0;
 }
 
 /**
- * This SQLIte3 query callback just returns the number of rows seen
- * by a SELECT statement in the 'data' parameter
- *
- * @param data         Output parameter to update with number of rows
- * @param nCols        The number of columns or the row
- * @param colValues    The column values
- * @param colNames     The column names
- * @return             0 on success, 1 otherwise
- */
-static int selectCallback(void *data,
-			  int nCols,
-			  char **colValues,
-			  char **colNames)
-{
-int *nRows = (int *)data;
-	// Increment the number of rows seen
-	*nRows++;
-
-	// Set OK
-	return 0;
-}
-
-/**
- * This SQLIte3 query count callback just returns the number of rows
- * as per 'count(*)' column
- * by a SELECT statement in the 'data' parameter
- *
- * @param data         Output parameter to update with number of rows
- * @param nCols        The number of columns or the row
- * @param colValues    The column values
- * @param colNames     The column names
- * @return             0 on success, 1 otherwise
- */
-static int countCallback(void *data,
-			 int nCols,
-			 char **colValues,
-			 char **colNames)
-{
-int *nRows = (int *)data;
-
-	// Return the value of the first column: the count(*)
-	*nRows = atoi(colValues[0]);
-
-	// Set OK
-	return 0;
-}
-
-/**
- * Perform a query against the readings table
- *
- * retrieveReadings, used by the API, returns timestamp in localtime.
+ * Perform a delete against a common table
  *
  */
-bool Connection::retrieveReadings(const string& condition, string& resultSet)
+int Connection::deleteRows(const string& table, const string& condition)
 {
 // Default template parameter uses UTF8 and MemoryPoolAllocator.
-Document	document;
+Document document;
 SQLBuffer	sql;
-// Extra constraints to add to where clause
-SQLBuffer	jsonConstraints;
-
-	try {
-		if (inMemory == NULL)
+ 
+	sql.append("DELETE FROM foglamp.");
+	sql.append(table);
+	if (! condition.empty())
+	{
+		sql.append(" WHERE ");
+		if (document.Parse(condition.c_str()).HasParseError())
 		{
-			raiseError("retrieve", "No SQLite 3 db connection available");
-			return false;
-		}
-
-		if (condition.empty())
-		{
-			const char *sql_cmd = R"(
-					SELECT
-						id,
-						asset_code,
-						read_key,
-						reading,
-						strftime(')" F_DATEH24_SEC R"(', user_ts, 'localtime')  ||
-						substr(user_ts, instr(user_ts, '.'), 7) AS user_ts,
-						strftime(')" F_DATEH24_MS R"(', ts, 'localtime') AS ts
-					FROM readings)";
-
-			sql.append(sql_cmd);
+			raiseError("delete", "Failed to parse JSON payload");
+			return -1;
 		}
 		else
 		{
-			if (document.Parse(condition.c_str()).HasParseError())
+			if (document.HasMember("where"))
 			{
-				raiseError("retrieve", "Failed to parse JSON payload");
-				return false;
-			}
-			if (document.HasMember("aggregate"))
-			{
-				sql.append("SELECT ");
-				if (document.HasMember("modifier"))
+				if (!jsonWhereClause(document["where"], sql))
 				{
-					sql.append(document["modifier"].GetString());
-					sql.append(' ');
+					return -1;
 				}
-				if (!jsonAggregates(document, document["aggregate"], sql, jsonConstraints, true))
-				{
-					return false;
-				}
-				sql.append(" FROM foglamp.");
-			}
-			else if (document.HasMember("return"))
-			{
-				int col = 0;
-				Value& columns = document["return"];
-				if (! columns.IsArray())
-				{
-					raiseError("retrieve", "The property return must be an array");
-					return false;
-				}
-				sql.append("SELECT ");
-				if (document.HasMember("modifier"))
-				{
-					sql.append(document["modifier"].GetString());
-					sql.append(' ');
-				}
-				for (Value::ConstValueIterator itr = columns.Begin(); itr != columns.End(); ++itr)
-				{
-
-					if (col)
-						sql.append(", ");
-					if (!itr->IsObject())	// Simple column name
-					{
-						if (strcmp(itr->GetString() ,"user_ts") == 0)
-						{
-							// Display without TZ expression and microseconds also
-							sql.append(" strftime('" F_DATEH24_SEC "', user_ts, 'localtime') ");
-							sql.append(" || substr(user_ts, instr(user_ts, '.'), 7) ");
-							sql.append(" as  user_ts ");
-						}
-						else if (strcmp(itr->GetString() ,"ts") == 0)
-						{
-							// Display without TZ expression and microseconds also
-							sql.append(" strftime('" F_DATEH24_MS "', ts, 'localtime') ");
-							sql.append(" as ts ");
-						}
-						else
-						{
-							sql.append(itr->GetString());
-						}
-
-					}
-					else
-					{
-						if (itr->HasMember("column"))
-						{
-							if (! (*itr)["column"].IsString())
-							{
-								raiseError("rerieve",
-									   "column must be a string");
-								return false;
-							}
-							if (itr->HasMember("format"))
-							{
-								if (! (*itr)["format"].IsString())
-								{
-									raiseError("rerieve",
-										   "format must be a string");
-									return false;
-								}
-
-								// SQLite 3 date format.
-								string new_format;
-								applyColumnDateFormat((*itr)["format"].GetString(),
-										      (*itr)["column"].GetString(),
-										      new_format, true);
-								// Add the formatted column or use it as is
-								sql.append(new_format);
-							}
-							else if (itr->HasMember("timezone"))
-							{
-								if (! (*itr)["timezone"].IsString())
-								{
-									raiseError("rerieve",
-										   "timezone must be a string");
-									return false;
-								}
-								// SQLite3 doesnt support time zone formatting
-								const char *tz = (*itr)["timezone"].GetString();
-
-								if (strncasecmp(tz, "utc", 3) == 0)
-								{
-									if (strcmp((*itr)["column"].GetString() ,"user_ts") == 0)
-									{
-										// Extract milliseconds and microseconds for the user_ts fields
-
-										sql.append("strftime('" F_DATEH24_SEC "', user_ts, 'utc') ");
-										sql.append(" || substr(user_ts, instr(user_ts, '.'), 7) ");
-										if (! itr->HasMember("alias"))
-										{
-											sql.append(" AS ");
-											sql.append((*itr)["column"].GetString());
-										}
-									}
-									else
-									{
-										sql.append("strftime('" F_DATEH24_MS "', ");
-										sql.append((*itr)["column"].GetString());
-										sql.append(", 'utc')");
-										if (! itr->HasMember("alias"))
-										{
-											sql.append(" AS ");
-											sql.append((*itr)["column"].GetString());
-										}
-									}
-								}
-								else if (strncasecmp(tz, "localtime", 9) == 0)
-								{
-									if (strcmp((*itr)["column"].GetString() ,"user_ts") == 0)
-									{
-										// Extract milliseconds and microseconds for the user_ts fields
-
-										sql.append("strftime('" F_DATEH24_SEC "', user_ts, 'localtime') ");
-										sql.append(" || substr(user_ts, instr(user_ts, '.'), 7) ");
-										if (! itr->HasMember("alias"))
-										{
-											sql.append(" AS ");
-											sql.append((*itr)["column"].GetString());
-										}
-									}
-									else
-									{
-										sql.append("strftime('" F_DATEH24_MS "', ");
-										sql.append((*itr)["column"].GetString());
-										sql.append(", 'localtime')");
-										if (! itr->HasMember("alias"))
-										{
-											sql.append(" AS ");
-											sql.append((*itr)["column"].GetString());
-										}
-									}
-								}
-								else
-								{
-									raiseError("retrieve",
-										   "SQLite3 plugin does not support timezones in queries");
-									return false;
-								}
-
-							}
-							else
-							{
-
-								if (strcmp((*itr)["column"].GetString() ,"user_ts") == 0)
-								{
-									// Extract milliseconds and microseconds for the user_ts fields
-
-									sql.append("strftime('" F_DATEH24_SEC "', user_ts, 'localtime') ");
-									sql.append(" || substr(user_ts, instr(user_ts, '.'), 7) ");
-									if (! itr->HasMember("alias"))
-									{
-										sql.append(" AS ");
-										sql.append((*itr)["column"].GetString());
-									}
-								}
-								else
-								{
-									sql.append("strftime('" F_DATEH24_MS "', ");
-									sql.append((*itr)["column"].GetString());
-									sql.append(", 'localtime')");
-									if (! itr->HasMember("alias"))
-									{
-										sql.append(" AS ");
-										sql.append((*itr)["column"].GetString());
-									}
-								}
-
-							}
-							sql.append(' ');
-						}
-						else if (itr->HasMember("json"))
-						{
-							const Value& json = (*itr)["json"];
-							if (! returnJson(json, sql, jsonConstraints))
-								return false;
-						}
-						else
-						{
-							raiseError("retrieve",
-								   "return object must have either a column or json property");
-							return false;
-						}
-
-						if (itr->HasMember("alias"))
-						{
-							sql.append(" AS \"");
-							sql.append((*itr)["alias"].GetString());
-							sql.append('"');
-						}
-					}
-					col++;
-				}
-				sql.append(" FROM foglamp.");
 			}
 			else
 			{
-				sql.append("SELECT ");
-				if (document.HasMember("modifier"))
-				{
-					sql.append(document["modifier"].GetString());
-					sql.append(' ');
-				}
-				const char *sql_cmd = R"(
-						id,
-						asset_code,
-						read_key,
-						reading,
-						strftime(')" F_DATEH24_SEC R"(', user_ts, 'localtime')  ||
-						substr(user_ts, instr(user_ts, '.'), 7) AS user_ts,
-						strftime(')" F_DATEH24_MS R"(', ts, 'localtime') AS ts
-					FROM foglamp.)";
-
-				sql.append(sql_cmd);
-			}
-			sql.append("readings");
-			if (document.HasMember("where"))
-			{
-				sql.append(" WHERE ");
-			 
-				if (document.HasMember("where"))
-				{
-					if (!jsonWhereClause(document["where"], sql))
-					{
-						return false;
-					}
-				}
-				else
-				{
-					raiseError("retrieve",
-						   "JSON does not contain where clause");
-					return false;
-				}
-				if (! jsonConstraints.isEmpty())
-				{
-					sql.append(" AND ");
-                                        const char *jsonBuf =  jsonConstraints.coalesce();
-                                        sql.append(jsonBuf);
-                                        delete[] jsonBuf;
-				}
-			}
-			if (!jsonModifiers(document, sql))
-			{
-				return false;
+				raiseError("delete",
+					   "JSON does not contain where clause");
+				return -1;
 			}
 		}
-		sql.append(';');
+	}
+	sql.append(';');
 
-		const char *query = sql.coalesce();
-		logSQL("ReadingsRetrieve", query);
-		char *zErrMsg = NULL;
-		int rc;
-		sqlite3_stmt *stmt;
+	const char *query = sql.coalesce();
+	logSQL("CommonDelete", query);
+	char *zErrMsg = NULL;
+	int delete_rows;
+	int rc;
 
-		// Prepare the SQL statement and get the result set
-		rc = sqlite3_prepare_v2(inMemory, query, -1, &stmt, NULL);
+	// Exec the DELETE statement: no callback, no result set
+	m_writeAccessOngoing.fetch_add(1);
+	rc = SQLexec(dbHandle,
+		     query,
+		     NULL,
+		     NULL,
+		     &zErrMsg);
+	m_writeAccessOngoing.fetch_sub(1);
+	if (m_writeAccessOngoing == 0)
+		db_cv.notify_all();
 
-		// Release memory for 'query' var
+	// Check result code
+	if (rc == SQLITE_OK)
+	{
+		// Success. Release memory for 'query' var
 		delete[] query;
-
-		if (rc != SQLITE_OK)
-		{
-			raiseError("retrieve", sqlite3_errmsg(inMemory));
-			return false;
-		}
-
-		// Call result set mapping
-		rc = mapResultSet(stmt, resultSet);
-
-		// Delete result set
-		sqlite3_finalize(stmt);
-
-		// Check result set mapping errors
-		if (rc != SQLITE_DONE)
-		{
-			raiseError("retrieve", sqlite3_errmsg(inMemory));
-			// Failure
-			return false;
-		}
-		// Success
-		return true;
-	} catch (exception e) {
-		raiseError("retrieve", "Internal error: %s", e.what());
-	}
-}
-
-
-/**
- * Format a date to a fixed format with milliseconds, microseconds and
- * timezone expressed, examples :
- *
- *   case - formatted |2019-01-01 10:01:01.000000+00:00| date |2019-01-01 10:01:01|
- *   case - formatted |2019-02-01 10:02:01.000000+00:00| date |2019-02-01 10:02:01.0|
- *   case - formatted |2019-02-02 10:02:02.841000+00:00| date |2019-02-02 10:02:02.841|
- *   case - formatted |2019-02-03 10:02:03.123456+00:00| date |2019-02-03 10:02:03.123456|
- *   case - formatted |2019-03-01 10:03:01.100000+00:00| date |2019-03-01 10:03:01.1+00:00|
- *   case - formatted |2019-03-02 10:03:02.123000+00:00| date |2019-03-02 10:03:02.123+00:00|
- *   case - formatted |2019-03-03 10:03:03.123456+00:00| date |2019-03-03 10:03:03.123456+00:00|
- *   case - formatted |2019-03-04 10:03:04.123456+01:00| date |2019-03-04 10:03:04.123456+01:00|
- *   case - formatted |2019-03-05 10:03:05.123456-01:00| date |2019-03-05 10:03:05.123456-01:00|
- *   case - formatted |2019-03-04 10:03:04.123456+02:30| date |2019-03-04 10:03:04.123456+02:30|
- *   case - formatted |2019-03-05 10:03:05.123456-02:30| date |2019-03-05 10:03:05.123456-02:30|
- *
- * @param out	false if the date is invalid
- *
- */
-bool Connection::formatDate(char *formatted_date, size_t buffer_size, const char *date) {
-
-	struct timeval tv = {0};
-	struct tm tm  = {0};
-	char *valid_date = nullptr;
-
-	// Extract up to seconds
-	memset(&tm, 0, sizeof(tm));
-	valid_date = strptime(date, F_DATEH24_SEC, &tm);
-
-	if (! valid_date)
-	{
-		return (false);
-	}
-
-	strftime (formatted_date, buffer_size, F_DATEH24_SEC, &tm);
-
-	// Work out the microseconds from the fractional part of the seconds
-	char fractional[10] = {0};
-	sscanf(date, "%*d-%*d-%*d %*d:%*d:%*d.%[0-9]*", fractional);
-	// Truncate to max 6 digits
-	fractional[6] = 0;
-	int multiplier = 6 - (int)strlen(fractional);
-	if (multiplier < 0)
-		multiplier = 0;
-	while (multiplier--)
-		strcat(fractional, "0");
-
-	strcat(formatted_date ,".");
-	strcat(formatted_date ,fractional);
-
-	// Handles timezone
-	char timezone_hour[5] = {0};
-	char timezone_min[5] = {0};
-	char sign[2] = {0};
-
-	sscanf(date, "%*d-%*d-%*d %*d:%*d:%*d.%*d-%2[0-9]:%2[0-9]", timezone_hour, timezone_min);
-	if (timezone_hour[0] != 0)
-	{
-		strcat(sign, "-");
+        	return sqlite3_changes(dbHandle);
 	}
 	else
 	{
-		memset(timezone_hour, 0, sizeof(timezone_hour));
-		memset(timezone_min,  0, sizeof(timezone_min));
+ 		raiseError("delete", zErrMsg);
+		sqlite3_free(zErrMsg);
+		Logger::getLogger()->error("SQL statement: %s", query);
+		delete[] query;
 
-		sscanf(date, "%*d-%*d-%*d %*d:%*d:%*d.%*d+%2[0-9]:%2[0-9]", timezone_hour, timezone_min);
-		if  (timezone_hour[0] != 0)
-		{
-			strcat(sign, "+");
-		}
-		else
-		{
-			// No timezone is expressed in the source date
-			// the default UTC is added
-			strcat(formatted_date, "+00:00");
-		}
+		// Failure
+		return -1;
 	}
-
-	if (sign[0] != 0)
-	{
-		if (timezone_hour[0] != 0)
-		{
-			strcat(formatted_date, sign);
-
-			// Pad with 0 if an hour having only 1 digit was provided
-			// +1 -> +01
-			if (strlen(timezone_hour) == 1)
-				strcat(formatted_date, "0");
-
-			strcat(formatted_date, timezone_hour);
-			strcat(formatted_date, ":");
-		}
-
-		if (timezone_min[0] != 0)
-		{
-			strcat(formatted_date, timezone_min);
-
-			// Pad with 0 if minutes having only 1 digit were provided
-			// 3 -> 30
-			if (strlen(timezone_min) == 1)
-				strcat(formatted_date, "0");
-
-		}
-		else
-		{
-			// Minutes aren't expressed in the source date
-			strcat(formatted_date, "00");
-		}
-	}
-
-
-	return (true);
-
-
 }
 
 /**
@@ -1231,12 +545,20 @@ bool 		add_row = false;
 	char *zErrMsg = NULL;
 	int rc;
 
+	{
+	m_writeAccessOngoing.fetch_add(1);
+	unique_lock<mutex> lck(db_mutex);
+
 	// Exec the INSERT statement: no callback, no result set
-	rc = SQLexec(inMemory,
+	rc = SQLexec(dbHandle,
 		     query,
 		     NULL,
 		     NULL,
 		     &zErrMsg);
+
+	m_writeAccessOngoing.fetch_sub(1);
+	db_cv.notify_all();
+	}
 
 	// Release memory for 'query' var
 	delete[] query;
@@ -1245,7 +567,7 @@ bool 		add_row = false;
 	if (rc == SQLITE_OK)
 	{
 		// Success
-		return sqlite3_changes(inMemory);
+		return sqlite3_changes(dbHandle);
 	}
 	else
 	{
@@ -1259,6 +581,7 @@ bool 		add_row = false;
 
 /**
  * Fetch a block of readings from the reading table
+ * It might not work with SQLite 3
  *
  * Fetch, used by the north side, returns timestamp in UTC.
  *
@@ -1301,17 +624,16 @@ int retrieve;
 		 sql_cmd,
 		 id,
 		 blksize);
-
 	logSQL("ReadingsFetch", sqlbuffer);
 	sqlite3_stmt *stmt;
 	// Prepare the SQL statement and get the result set
-	if (sqlite3_prepare_v2(inMemory,
+	if (sqlite3_prepare_v2(dbHandle,
 			       sqlbuffer,
 			       -1,
 			       &stmt,
 			       NULL) != SQLITE_OK)
 	{
-		raiseError("retrieve", sqlite3_errmsg(inMemory));
+		raiseError("retrieve", sqlite3_errmsg(dbHandle));
 
 		// Failure
 		return false;
@@ -1327,7 +649,7 @@ int retrieve;
 		// Check result set errors
 		if (rc != SQLITE_DONE)
 		{
-			raiseError("retrieve", sqlite3_errmsg(inMemory));
+			raiseError("retrieve", sqlite3_errmsg(dbHandle));
 
 			// Failure
 			return false;
@@ -1341,6 +663,355 @@ int retrieve;
 }
 
 /**
+ * Perform a query against the readings table
+ *
+ * retrieveReadings, used by the API, returns timestamp in localtime.
+ *
+ */
+bool Connection::retrieveReadings(const string& condition, string& resultSet)
+{
+// Default template parameter uses UTF8 and MemoryPoolAllocator.
+Document	document;
+SQLBuffer	sql;
+// Extra constraints to add to where clause
+SQLBuffer	jsonConstraints;
+bool		isAggregate = false;
+
+	try {
+		if (dbHandle == NULL)
+		{
+			raiseError("retrieve", "No SQLite 3 db connection available");
+			return false;
+		}
+
+		if (condition.empty())
+		{
+			const char *sql_cmd = R"(
+					SELECT
+						id,
+						asset_code,
+						read_key,
+						reading,
+						strftime(')" F_DATEH24_SEC R"(', user_ts, 'localtime')  ||
+						substr(user_ts, instr(user_ts, '.'), 7) AS user_ts,
+						strftime(')" F_DATEH24_MS R"(', ts, 'localtime') AS ts
+					FROM foglamp.readings)";
+
+			sql.append(sql_cmd);
+		}
+		else
+		{
+			if (document.Parse(condition.c_str()).HasParseError())
+			{
+				raiseError("retrieve", "Failed to parse JSON payload");
+				return false;
+			}
+			if (document.HasMember("aggregate"))
+			{
+				isAggregate = true;
+				sql.append("SELECT ");
+				if (document.HasMember("modifier"))
+				{
+					sql.append(document["modifier"].GetString());
+					sql.append(' ');
+				}
+				if (!jsonAggregates(document, document["aggregate"], sql, jsonConstraints, true))
+				{
+					return false;
+				}
+				sql.append(" FROM foglamp.");
+			}
+			else if (document.HasMember("return"))
+			{
+				int col = 0;
+				Value& columns = document["return"];
+				if (! columns.IsArray())
+				{
+					raiseError("retrieve", "The property return must be an array");
+					return false;
+				}
+				sql.append("SELECT ");
+				if (document.HasMember("modifier"))
+				{
+					sql.append(document["modifier"].GetString());
+					sql.append(' ');
+				}
+				for (Value::ConstValueIterator itr = columns.Begin(); itr != columns.End(); ++itr)
+				{
+					if (col)
+						sql.append(", ");
+					if (!itr->IsObject())	// Simple column name
+					{
+						if (strcmp(itr->GetString() ,"user_ts") == 0)
+						{
+							// Display without TZ expression and microseconds also
+							sql.append(" strftime('" F_DATEH24_SEC "', user_ts, 'localtime') ");
+							sql.append(" || substr(user_ts, instr(user_ts, '.'), 7) ");
+							sql.append(" as  user_ts ");
+						}
+						else if (strcmp(itr->GetString() ,"ts") == 0)
+						{
+							// Display without TZ expression and microseconds also
+							sql.append(" strftime('" F_DATEH24_MS "', ts, 'localtime') ");
+							sql.append(" as ts ");
+						}
+						else
+						{
+							sql.append(itr->GetString());
+						}
+					}
+					else
+					{
+						if (itr->HasMember("column"))
+						{
+							if (! (*itr)["column"].IsString())
+							{
+								raiseError("retrieve",
+									   "column must be a string");
+								return false;
+							}
+							if (itr->HasMember("format"))
+							{
+								if (! (*itr)["format"].IsString())
+								{
+									raiseError("retrieve",
+										   "format must be a string");
+									return false;
+								}
+
+								// SQLite 3 date format.
+								string new_format;
+								applyColumnDateFormatLocaltime((*itr)["format"].GetString(),
+										      (*itr)["column"].GetString(),
+										      new_format, true);
+								// Add the formatted column or use it as is
+								sql.append(new_format);
+							}
+							else if (itr->HasMember("timezone"))
+							{
+								if (! (*itr)["timezone"].IsString())
+								{
+									raiseError("retrieve",
+										   "timezone must be a string");
+									return false;
+								}
+								// SQLite3 doesnt support time zone formatting
+								const char *tz = (*itr)["timezone"].GetString();
+
+								if (strncasecmp(tz, "utc", 3) == 0)
+								{
+									if (strcmp((*itr)["column"].GetString() ,"user_ts") == 0)
+									{
+										// Extract milliseconds and microseconds for the user_ts fields
+
+										sql.append("strftime('" F_DATEH24_SEC "', user_ts, 'utc') ");
+										sql.append(" || substr(user_ts, instr(user_ts, '.'), 7) ");
+										if (! itr->HasMember("alias"))
+										{
+											sql.append(" AS ");
+											sql.append((*itr)["column"].GetString());
+										}
+									}
+									else
+									{
+										sql.append("strftime('" F_DATEH24_MS "', ");
+										sql.append((*itr)["column"].GetString());
+										sql.append(", 'utc')");
+										if (! itr->HasMember("alias"))
+										{
+											sql.append(" AS ");
+											sql.append((*itr)["column"].GetString());
+										}
+									}
+								}
+								else if (strncasecmp(tz, "localtime", 9) == 0)
+								{
+									if (strcmp((*itr)["column"].GetString() ,"user_ts") == 0)
+									{
+										// Extract milliseconds and microseconds for the user_ts fields
+
+										sql.append("strftime('" F_DATEH24_SEC "', user_ts, 'localtime') ");
+										sql.append(" || substr(user_ts, instr(user_ts, '.'), 7) ");
+										if (! itr->HasMember("alias"))
+										{
+											sql.append(" AS ");
+											sql.append((*itr)["column"].GetString());
+										}
+									}
+									else
+									{
+										sql.append("strftime('" F_DATEH24_MS "', ");
+										sql.append((*itr)["column"].GetString());
+										sql.append(", 'localtime')");
+										if (! itr->HasMember("alias"))
+										{
+											sql.append(" AS ");
+											sql.append((*itr)["column"].GetString());
+										}
+									}
+								}
+								else
+								{
+									raiseError("retrieve",
+										   "SQLite3 plugin does not support timezones in queries");
+									return false;
+								}
+							}
+							else
+							{
+
+								if (strcmp((*itr)["column"].GetString() ,"user_ts") == 0)
+								{
+									// Extract milliseconds and microseconds for the user_ts fields
+
+									sql.append("strftime('" F_DATEH24_SEC "', user_ts, 'localtime') ");
+									sql.append(" || substr(user_ts, instr(user_ts, '.'), 7) ");
+									if (! itr->HasMember("alias"))
+									{
+										sql.append(" AS ");
+										sql.append((*itr)["column"].GetString());
+									}
+								}
+								else
+								{
+									sql.append("strftime('" F_DATEH24_MS "', ");
+									sql.append((*itr)["column"].GetString());
+									sql.append(", 'localtime')");
+									if (! itr->HasMember("alias"))
+									{
+										sql.append(" AS ");
+										sql.append((*itr)["column"].GetString());
+									}
+								}
+							}
+							sql.append(' ');
+						}
+						else if (itr->HasMember("json"))
+						{
+							const Value& json = (*itr)["json"];
+							if (! returnJson(json, sql, jsonConstraints))
+								return false;
+						}
+						else
+						{
+							raiseError("retrieve",
+								   "return object must have either a column or json property");
+							return false;
+						}
+
+						if (itr->HasMember("alias"))
+						{
+							sql.append(" AS \"");
+							sql.append((*itr)["alias"].GetString());
+							sql.append('"');
+						}
+					}
+					col++;
+				}
+				sql.append(" FROM foglamp.");
+			}
+			else
+			{
+				sql.append("SELECT ");
+				if (document.HasMember("modifier"))
+				{
+					sql.append(document["modifier"].GetString());
+					sql.append(' ');
+				}
+
+				const char *sql_cmd = R"(
+						id,
+						asset_code,
+						read_key,
+						reading,
+						strftime(')" F_DATEH24_SEC R"(', user_ts, 'localtime')  ||
+						substr(user_ts, instr(user_ts, '.'), 7) AS user_ts,
+						strftime(')" F_DATEH24_MS R"(', ts, 'localtime') AS ts
+					FROM foglamp.)";
+
+				sql.append(sql_cmd);
+			}
+			sql.append("readings");
+			if (document.HasMember("where"))
+			{
+				sql.append(" WHERE ");
+			 
+				if (document.HasMember("where"))
+				{
+					if (!jsonWhereClause(document["where"], sql))
+					{
+						return false;
+					}
+				}
+				else
+				{
+					raiseError("retrieve",
+						   "JSON does not contain where clause");
+					return false;
+				}
+				if (! jsonConstraints.isEmpty())
+				{
+					sql.append(" AND ");
+                                        const char *jsonBuf =  jsonConstraints.coalesce();
+                                        sql.append(jsonBuf);
+                                        delete[] jsonBuf;
+				}
+			}
+			else if (isAggregate)
+			{
+				/*
+				 * Performance improvement: force sqlite to use an index
+				 * if we are doing an aggregate and have no where clause.
+				 */
+				sql.append(" WHERE asset_code = asset_code");
+			}
+			if (!jsonModifiers(document, sql))
+			{
+				return false;
+			}
+		}
+		sql.append(';');
+
+		const char *query = sql.coalesce();
+		char *zErrMsg = NULL;
+		int rc;
+		sqlite3_stmt *stmt;
+
+		logSQL("ReadingsRetrieve", query);
+
+		// Prepare the SQL statement and get the result set
+		rc = sqlite3_prepare_v2(dbHandle, query, -1, &stmt, NULL);
+
+		// Release memory for 'query' var
+		delete[] query;
+
+		if (rc != SQLITE_OK)
+		{
+			raiseError("retrieve", sqlite3_errmsg(dbHandle));
+			return false;
+		}
+
+		// Call result set mapping
+		rc = mapResultSet(stmt, resultSet);
+
+		// Delete result set
+		sqlite3_finalize(stmt);
+
+		// Check result set mapping errors
+		if (rc != SQLITE_DONE)
+		{
+			raiseError("retrieve", sqlite3_errmsg(dbHandle));
+			// Failure
+			return false;
+		}
+		// Success
+		return true;
+	} catch (exception e) {
+		raiseError("retrieve", "Internal error: %s", e.what());
+	}
+}
+
+/**
  * Purge readings from the reading table
  */
 unsigned int  Connection::purgeReadings(unsigned long age,
@@ -1348,10 +1019,62 @@ unsigned int  Connection::purgeReadings(unsigned long age,
 					unsigned long sent,
 					std::string& result)
 {
-SQLBuffer sql;
 long unsentPurged = 0;
 long unsentRetained = 0;
 long numReadings = 0;
+unsigned long rowidLimit = 0, minrowidLimit = 0, maxrowidLimit = 0, rowidMin;
+struct timeval startTv, endTv;
+int blocks = 0;
+
+	Logger *logger = Logger::getLogger();
+
+	result = "{ \"removed\" : 0, ";
+	result += " \"unsentPurged\" : 0, ";
+	result += " \"unsentRetained\" : 0, ";
+	result += " \"readings\" : 0 }";
+
+	logger->info("Purge starting...");
+	gettimeofday(&startTv, NULL);
+	/*
+	 * We fetch the current rowid and limit the purge process to work on just
+	 * those rows present in the database when the purge process started.
+	 * This provents us looping in the purge process if new readings become
+	 * eligible for purging at a rate that is faster than we can purge them.
+	 */
+	{
+		char *zErrMsg = NULL;
+		int rc;
+		rc = SQLexec(dbHandle,
+		     "select max(rowid) from foglamp.readings;",
+	  	     rowidCallback,
+		     &rowidLimit,
+		     &zErrMsg);
+
+		if (rc != SQLITE_OK)
+		{
+ 			raiseError("purge - phase 0, fetching rowid limit ", zErrMsg);
+			sqlite3_free(zErrMsg);
+			return 0;
+		}
+		maxrowidLimit = rowidLimit;
+	}
+
+	{
+		char *zErrMsg = NULL;
+		int rc;
+		rc = SQLexec(dbHandle,
+		     "select min(rowid) from foglamp.readings;",
+	  	     rowidCallback,
+		     &minrowidLimit,
+		     &zErrMsg);
+
+		if (rc != SQLITE_OK)
+		{
+ 			raiseError("purge - phaase 0, fetching minrowid limit ", zErrMsg);
+			sqlite3_free(zErrMsg);
+			return 0;
+		}
+	}
 
 	if (age == 0)
 	{
@@ -1360,14 +1083,16 @@ long numReadings = 0;
 		 * So set age based on the data we have and continue.
 		 */
 		SQLBuffer oldest;
-		oldest.append("SELECT (strftime('%s','now', 'localtime') - strftime('%s', MIN(user_ts)))/360 FROM foglamp.readings;");
+		oldest.append("SELECT (strftime('%s','now', 'utc') - strftime('%s', MIN(user_ts)))/360 FROM foglamp.readings where rowid <= ");
+		oldest.append(rowidLimit);
+		oldest.append(';');
 		const char *query = oldest.coalesce();
 		char *zErrMsg = NULL;
 		int rc;
 		int purge_readings = 0;
 
 		// Exec query and get result in 'purge_readings' via 'selectCallback'
-		rc = SQLexec(inMemory,
+		rc = SQLexec(dbHandle,
 			     query,
 			     selectCallback,
 			     &purge_readings,
@@ -1381,127 +1106,216 @@ long numReadings = 0;
 		}
 		else
 		{
- 			raiseError("purge", zErrMsg);
+ 			raiseError("purge - phase 1", zErrMsg);
 			sqlite3_free(zErrMsg);
 			return 0;
 		}
 	}
-	if ((flags & 0x01) == 0)
+
 	{
-		// Get number of unsent rows we are about to remove
-		SQLBuffer unsentBuffer;
-		unsentBuffer.append("SELECT count(*) FROM foglamp.readings WHERE  user_ts < datetime('now', '-");
-		unsentBuffer.append(age);
-		unsentBuffer.append(" hours', 'localtime') AND id > ");
-		unsentBuffer.append(sent);
-		unsentBuffer.append(';');
-		const char *query = unsentBuffer.coalesce();
-		logSQL("ReadingsPurge", query);
+		/*
+		 * Refine rowid limit to just those rows older than age hours.
+		 */
 		char *zErrMsg = NULL;
 		int rc;
-		int unsent = 0;
+		unsigned long l = minrowidLimit;
+		unsigned long r = ((flags & 0x01) && sent) ? min(sent, rowidLimit) : rowidLimit;
+		r = max(r, l);
+		//logger->info("%s:%d: l=%u, r=%u, sent=%u, rowidLimit=%u, minrowidLimit=%u, flags=%u", __FUNCTION__, __LINE__, l, r, sent, rowidLimit, minrowidLimit, flags);
+		if (l == r)
+		{
+ 			logger->info("No data to purge: min_id == max_id == %u", minrowidLimit);
+			return 0;
+		}
 
-		// Exec query and get result in 'unsent' via 'countCallback'
-		rc = SQLexec(inMemory,
+		unsigned long m=l;
+
+		while (l <= r)
+		{
+			unsigned long midRowId = 0;
+			unsigned long prev_m = m;
+		    m = l + (r - l) / 2;
+			if (prev_m == m) break;
+
+			// e.g. select id from readings where rowid = 219867307 AND user_ts < datetime('now' , '-24 hours', 'utc');
+			SQLBuffer sqlBuffer;
+			sqlBuffer.append("select id from foglamp.readings where rowid = ");
+			sqlBuffer.append(m);
+			sqlBuffer.append(" AND user_ts < datetime('now' , '-");
+			sqlBuffer.append(age);
+			sqlBuffer.append(" hours');");
+			const char *query = sqlBuffer.coalesce();
+
+			rc = SQLexec(dbHandle,
+		     query,
+	  	     rowidCallback,
+		     &midRowId,
+		     &zErrMsg);
+
+			if (rc != SQLITE_OK)
+			{
+	 			raiseError("purge - phase 1, fetching midRowId ", zErrMsg);
+				sqlite3_free(zErrMsg);
+				return 0;
+			}
+
+			if (midRowId == 0) // mid row doesn't satisfy given condition for user_ts, so discard right/later half and look in left/earlier half
+			{
+				// search in earlier/left half
+				r = m - 1;
+			}
+			else //if (l != m)
+			{
+				// search in later/right half
+		        l = m + 1;
+			}
+		}
+
+		rowidLimit = m;
+
+		if (minrowidLimit == rowidLimit)
+		{
+ 			logger->info("No data to purge");
+			return 0;
+		}
+
+		rowidMin = minrowidLimit;
+	}
+	//logger->info("Purge collecting unsent row count");
+	if ((flags & 0x01) == 0)
+	{
+		char *zErrMsg = NULL;
+		int rc;
+		int lastPurgedId;
+		SQLBuffer idBuffer;
+		idBuffer.append("select id from foglamp.readings where rowid = ");
+		idBuffer.append(rowidLimit);
+		idBuffer.append(';');
+		const char *idQuery = idBuffer.coalesce();
+		rc = SQLexec(dbHandle,
+		     idQuery,
+	  	     rowidCallback,
+		     &lastPurgedId,
+		     &zErrMsg);
+
+		// Release memory for 'idQuery' var
+		delete[] idQuery;
+
+		if (rc != SQLITE_OK)
+		{
+ 			raiseError("purge - phase 0, fetching rowid limit ", zErrMsg);
+			sqlite3_free(zErrMsg);
+			return 0;
+		}
+
+		if (sent != 0 && lastPurgedId > sent)	// Unsent readings will be purged
+		{
+			// Get number of unsent rows we are about to remove
+			int unsent = rowidLimit - sent;
+			unsentPurged = unsent;
+		}
+	}
+	if (m_writeAccessOngoing)
+	{
+		while (m_writeAccessOngoing)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+	}
+
+	unsigned int deletedRows = 0;
+	char *zErrMsg = NULL;
+	unsigned int rowsAffected, totTime=0, prevBlocks=0, prevTotTime=0;
+	logger->info("Purge about to delete readings # %ld to %ld", rowidMin, rowidLimit);
+	while (rowidMin < rowidLimit)
+	{
+		blocks++;
+		rowidMin += purgeBlockSize;
+		if (rowidMin > rowidLimit)
+		{
+			rowidMin = rowidLimit;
+		}
+		SQLBuffer sql;
+		sql.append("DELETE FROM foglamp.readings WHERE rowid <= ");
+		sql.append(rowidMin);
+		sql.append(';');
+		const char *query = sql.coalesce();
+		logSQL("ReadingsPurge", query);
+
+		int rc;
+		{
+		unique_lock<mutex> lck(db_mutex);
+		if (m_writeAccessOngoing) db_cv.wait(lck);
+
+		START_TIME;
+		// Exec DELETE query: no callback, no resultset
+		rc = SQLexec(dbHandle,
 			     query,
-			     countCallback,
-			     &unsent,
+			     NULL,
+			     NULL,
 			     &zErrMsg);
+		END_TIME;
 
 		// Release memory for 'query' var
 		delete[] query;
 
-		if (rc == SQLITE_OK)
+		totTime += usecs;
+
+		if(usecs>150000)
 		{
-			unsentPurged = unsent;
+			std::this_thread::sleep_for(std::chrono::milliseconds(100+usecs/10000));
 		}
-		else
+		}
+
+		if (rc != SQLITE_OK)
 		{
- 			raiseError("retrieve", zErrMsg);
+			raiseError("purge - phase 3", zErrMsg);
 			sqlite3_free(zErrMsg);
+			// Release memory for 'query' var
+			delete[] query;
 			return 0;
 		}
-	}
-	
-	sql.append("DELETE FROM foglamp.readings WHERE user_ts < datetime('now', '-");
-	sql.append(age);
-	sql.append(" hours', 'localtime')");
-	if ((flags & 0x01) == 0x01)	// Don't delete unsent rows
+
+		// Get db changes
+		rowsAffected = sqlite3_changes(dbHandle);
+		deletedRows += rowsAffected;
+		logger->debug("Purge delete block #%d with %d readings", blocks, rowsAffected);
+
+		if(blocks % RECALC_PURGE_BLOCK_SIZE_NUM_BLOCKS == 0)
+		{
+			int prevAvg = prevTotTime/(prevBlocks?prevBlocks:1);
+			int currAvg = (totTime-prevTotTime)/(blocks-prevBlocks);
+			int avg = ((prevAvg?prevAvg:currAvg)*5 + currAvg*5) / 10; // 50% weightage for long term avg and 50% weightage for current avg
+			prevBlocks = blocks;
+			prevTotTime = totTime;
+			int deviation = abs(avg - TARGET_PURGE_BLOCK_DEL_TIME);
+			logger->debug("blocks=%d, totTime=%d usecs, prevAvg=%d usecs, currAvg=%d usecs, avg=%d usecs, TARGET_PURGE_BLOCK_DEL_TIME=%d usecs, deviation=%d usecs", 
+							blocks, totTime, prevAvg, currAvg, avg, TARGET_PURGE_BLOCK_DEL_TIME, deviation);
+			if (deviation > TARGET_PURGE_BLOCK_DEL_TIME/10)
+			{
+				float ratio = (float)TARGET_PURGE_BLOCK_DEL_TIME / (float)avg;
+				if (ratio > 2.0) ratio = 2.0;
+				if (ratio < 0.5) ratio = 0.5;
+				purgeBlockSize = (float)purgeBlockSize * ratio;
+				purgeBlockSize = purgeBlockSize / PURGE_BLOCK_SZ_GRANULARITY * PURGE_BLOCK_SZ_GRANULARITY;
+				if (purgeBlockSize < MIN_PURGE_DELETE_BLOCK_SIZE)
+					purgeBlockSize = MIN_PURGE_DELETE_BLOCK_SIZE;
+				if (purgeBlockSize > MAX_PURGE_DELETE_BLOCK_SIZE)
+					purgeBlockSize = MAX_PURGE_DELETE_BLOCK_SIZE;
+				logger->debug("Changed purgeBlockSize to %d", purgeBlockSize);
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		}
+		//Logger::getLogger()->debug("Purge delete block #%d with %d readings", blocks, rowsAffected);
+	} while (rowidMin  < rowidLimit);
+
+	unsentRetained = maxrowidLimit - rowidLimit;
+
+	numReadings = maxrowidLimit - minrowidLimit - deletedRows;
+
+	if (sent == 0)	// Special case when not north process is used
 	{
-		sql.append(" AND id < ");
-		sql.append(sent);
-	}
-	sql.append(';');
-	const char *query = sql.coalesce();
-	logSQL("ReadingsPurge", query);
-	char *zErrMsg = NULL;
-	int rc;
-	int rows_deleted;
-
-	// Exec DELETE query: no callback, no resultset
-	rc = SQLexec(inMemory,
-		     query,
-		     NULL,
-		     NULL,
-		     &zErrMsg);
-
-	// Release memory for 'query' var
-	delete[] query;
-
-	if (rc != SQLITE_OK)
-	{
- 		raiseError("retrieve", zErrMsg);
-		sqlite3_free(zErrMsg);
-		return 0;
-	}
-
-	// Get db changes
-	unsigned int deletedRows = sqlite3_changes(inMemory);
-
-	SQLBuffer retainedBuffer;
-	retainedBuffer.append("SELECT count(*) FROM foglamp.readings WHERE id > ");
-	retainedBuffer.append(sent);
-	retainedBuffer.append(';');
-	const char *query_r = retainedBuffer.coalesce();
-	logSQL("ReadingsPurge", query_r);
-	int retained_unsent = 0;
-
-	// Exec query and get result in 'retained_unsent' via 'countCallback'
-	rc = SQLexec(inMemory,
-		     query_r,
-		     countCallback,
-		     &retained_unsent,
-		     &zErrMsg);
-
-	// Release memory for 'query_r' var
-	delete[] query_r;
-
-	if (rc == SQLITE_OK)
-	{
-		unsentRetained = retained_unsent;
-	}
-	else
-	{
- 		raiseError("retrieve", zErrMsg);
-		sqlite3_free(zErrMsg);
-	}
-
-	int readings_num = 0;
-	// Exec query and get result in 'readings_num' via 'countCallback'
-	rc = SQLexec(inMemory,
-		    "SELECT count(*) FROM foglamp.readings",
-		     countCallback,
-		     &readings_num,
-		     &zErrMsg);
-
-	if (rc == SQLITE_OK)
-	{
-		numReadings = readings_num;
-	}
-	else
-	{
- 		raiseError("retrieve", zErrMsg);
-		sqlite3_free(zErrMsg);
+		unsentPurged = deletedRows;
 	}
 
 	ostringstream convert;
@@ -1509,13 +1323,20 @@ long numReadings = 0;
 	convert << "{ \"removed\" : " << deletedRows << ", ";
 	convert << " \"unsentPurged\" : " << unsentPurged << ", ";
 	convert << " \"unsentRetained\" : " << unsentRetained << ", ";
-    	convert << " \"readings\" : " << numReadings << " }";
+    convert << " \"readings\" : " << numReadings << " }";
 
 	result = convert.str();
+
+	//logger->debug("Purge result=%s", result.c_str());
+
+	gettimeofday(&endTv, NULL);
+	unsigned long duration = (1000000 * (endTv.tv_sec - startTv.tv_sec)) + endTv.tv_usec - startTv.tv_usec;
+	logger->info("Purge process complete in %d blocks in %lduS", blocks, duration);
 
 	return deletedRows;
 }
 
+#ifdef AAAA
 /**
  * Process the aggregate options and return the columns to be selected
  */
@@ -1539,16 +1360,19 @@ bool Connection::jsonAggregates(const Value& payload,
 				   "Missing property \"column\" or \"json\"");
 			return false;
 		}
-		string column_name = aggregates["column"].GetString();
-
 		sql.append(aggregates["operation"].GetString());
 		sql.append('(');
 		if (aggregates.HasMember("column"))
 		{
-			if (strcmp(aggregates["operation"].GetString(), "count") != 0)
+			string col = aggregates["column"].GetString();
+			if (col.compare("*") == 0)	// Faster to count ROWID rather than *
+			{
+				sql.append("ROWID");
+			}
+			else
 			{
 				// an operation different from the 'count' is requested
-				if (isTableReading && (column_name.compare("user_ts") == 0) )
+				if (isTableReading && (col.compare("user_ts") == 0) )
 				{
 					sql.append("strftime('" F_DATEH24_SEC "', user_ts, 'localtime') ");
 					sql.append(" || substr(user_ts, instr(user_ts, '.'), 7) ");
@@ -1556,14 +1380,9 @@ bool Connection::jsonAggregates(const Value& payload,
 				else
 				{
 					sql.append("\"");
-					sql.append(column_name);
+					sql.append(col);
 					sql.append("\"");
 				}
-			}
-			else
-			{
-				// 'count' operation is requested
-				sql.append(column_name);
 			}
 		}
 		else if (aggregates.HasMember("json"))
@@ -1951,9 +1770,11 @@ bool Connection::jsonAggregates(const Value& payload,
 	}
 	return true;
 }
+#endif
 
+#ifdef AAAA
 /**
- * Process the modifiers for limit, skip, sort and group
+ * Process the modifers for limit, skip, sort and group
  */
 bool Connection::jsonModifiers(const Value& payload, SQLBuffer& sql)
 {
@@ -2125,7 +1946,9 @@ bool Connection::jsonModifiers(const Value& payload, SQLBuffer& sql)
 	}
 	return true;
 }
+#endif
 
+#ifdef AAAA
 /**
  * Convert a JSON where clause into a SQLite3 where clause
  *
@@ -2282,7 +2105,9 @@ bool Connection::jsonWhereClause(const Value& whereClause,
 
 	return true;
 }
+#endif
 
+#ifdef AAAA
 /**
  * This routine uses SQLit3 JSON1 extension functions
  */
@@ -2370,136 +2195,4 @@ bool Connection::returnJson(const Value& json,
 
 	return true;
 }
-
-/**
- * Remove whitespace at both ends of a string
- */
-char *Connection::trim(char *str)
-{
-char *ptr;
-
-	while (*str && *str == ' ')
-		str++;
-
-	ptr = str + strlen(str) - 1;
-	while (ptr > str && *ptr == ' ')
-	{
-		*ptr = 0;
-		ptr--;
-	}
-	return str;
-}
-
-/**
- * Raise an error to return from the plugin
- */
-void Connection::raiseError(const char *operation, const char *reason, ...)
-{
-MemConnectionManager *manager = MemConnectionManager::getInstance();
-char	tmpbuf[512];
-
-	va_list ap;
-	va_start(ap, reason);
-	vsnprintf(tmpbuf, sizeof(tmpbuf), reason, ap);
-	va_end(ap);
-	Logger::getLogger()->error("SQLite3 Memory storage plugin raising error: %s", tmpbuf);
-	manager->setError(operation, tmpbuf, false);
-}
-
-/**
- * Return the sie of a given table in bytes
- */
-long Connection::tableSize(const string& table)
-{
-SQLBuffer buf;
-
- 	raiseError("tableSize", "Not available in SQLite3 Memory storage plugin");
-	return -1;
-}
-
-/**
- * String escape routine
- */
-const string Connection::escape(const string& str)
-{
-char    *buffer;
-const char    *p1;
-char  *p2;
-string  newString;
-
-    if (str.find_first_of('\'') == string::npos)
-    {
-        return str;
-    }
-
-    buffer = (char *)malloc(str.length() * 2);
-
-    p1 = str.c_str();
-    p2 = buffer;
-    while (*p1)
-    {
-        if (*p1 == '\'')
-        {
-            *p2++ = '\'';
-            *p2++ = '\'';
-            p1++;
-        }
-        else
-        {
-            *p2++ = *p1++;
-        }
-    }
-    *p2 = 0;
-    newString = string(buffer);
-    free(buffer);
-    return newString;
-}
-
-/**
- * Optionally log SQL statement execution
- *
- * @param	tag	A string tag that says why the SQL is being executed
- * @param	stmt	The SQL statement itself
- */
-void Connection::logSQL(const char *tag, const char *stmt)
-{
-	if (m_logSQL)
-	{
-		Logger::getLogger()->info("%s: %s", tag, stmt);
-	}
-}
-
-/**
- * SQLITE wrapper to rety statements when the database is locked
- *
- * @param	db	The open SQLite database
- * @param	sql	The SQL to execute
- * @param	callback	Callback function
- * @param	cbArg		Callback 1st argument
- * @param	errmsg		Locaiton to write error message
- */
-int Connection::SQLexec(sqlite3 *db, const char *sql, int (*callback)(void*,int,char**,char**),
-  			void *cbArg, char **errmsg)
-{
-int retries = 0, rc;
-
-	do {
-		rc = sqlite3_exec(db, sql, callback, cbArg, errmsg);
-		retries++;
-		if (rc == SQLITE_LOCKED || rc == SQLITE_BUSY)
-		{
-			usleep(retries * 1000);	// sleep retries milliseconds
-		}
-	} while (retries < MAX_RETRIES && (rc == SQLITE_LOCKED || rc == SQLITE_BUSY));
-
-	if (rc == SQLITE_LOCKED)
-	{
-		Logger::getLogger()->error("Database still locked after maximum retries");
-	}
-	if (rc == SQLITE_BUSY)
-	{
-		Logger::getLogger()->error("Database still busy after maximum retries");
-	}
-
-	return rc;
-}
+#endif
