@@ -4,14 +4,14 @@
 # See: http://foglamp.readthedocs.io/
 # FOGLAMP_END
 
+
 import os
-import subprocess
-from pathlib import Path
 from aiohttp import web
 from foglamp.services.core.snapshot import SnapshotPluginBuilder
 from foglamp.common.common import _FOGLAMP_ROOT, _FOGLAMP_DATA
 
-__author__ = "Ashish Jabble"
+
+__author__ = "Amarendra K Sinha"
 __copyright__ = "Copyright (c) 2017 OSIsoft, LLC"
 __license__ = "Apache 2.0"
 __version__ = "${VERSION}"
@@ -52,15 +52,15 @@ async def post_snapshot(request):
         snapshot_name = await SnapshotPluginBuilder(snapshot_dir).build()
     except Exception as ex:
         raise web.HTTPInternalServerError(reason='Support could not be created. {}'.format(str(ex)))
-
-    return web.json_response({"snapshot created": snapshot_name})
+    else:
+        return web.json_response({"snapshot created": snapshot_name})
 
 
 async def put_snapshot(request):
     """extract a snapshot
 
     :Example:
-        curl -X PUT http://localhost:8081/foglamp/plugins/snapshot/snapshot-180311-18-03-36.tar.gz -H "Accept-Encoding: gzip" --write-out "size_download=%{size_download}\n" --compressed
+        curl -X PUT http://localhost:8081/foglamp/plugins/snapshot/snapshot-180311-18-03-36.tar.gz
     """
     snapshot_name = request.match_info.get('id', None)
 
@@ -76,8 +76,8 @@ async def put_snapshot(request):
             raise web.HTTPNotFound(reason='{} not found'.format(snapshot_name))
 
     try:
-        p = "{}/{}",format(snapshot_dir, snapshot_name)
-        retval = await SnapshotPluginBuilder(snapshot_dir).extract_files(p)
+        p = "{}/{}".format(snapshot_dir, snapshot_name)
+        retval = SnapshotPluginBuilder(snapshot_dir).extract_files(p)
     except Exception as ex:
         raise web.HTTPInternalServerError(reason='Snapshot {} could not be restored. {}'.format(snapshot_name, str(ex)))
     else:
@@ -117,5 +117,4 @@ def _get_snapshot_dir():
         snapshot_dir = os.path.expanduser(_FOGLAMP_DATA + '/tmp/snapshot')
     else:
         snapshot_dir = os.path.expanduser(_FOGLAMP_ROOT + '/data/tmp/snapshot')
-
     return snapshot_dir

@@ -4,8 +4,7 @@
 # See: http://foglamp.readthedocs.io/
 # FOGLAMP_END
 
-""" Provides utility functions to build a FogLAMP Support bundle.
-"""
+""" Provides utility functions to take snapshot of Foglamp"""
 
 import datetime
 import os
@@ -14,7 +13,6 @@ import glob
 import json
 import tarfile
 import fnmatch
-from foglamp.services.core.connect import *
 from foglamp.common import logger
 from foglamp.common.common import _FOGLAMP_ROOT
 
@@ -32,7 +30,6 @@ class SnapshotPluginBuilder:
 
     _out_file_path = None
     _interim_file_path = None
-    _storage = None
 
     def __init__(self, snapshot_plugin_dir):
         try:
@@ -43,7 +40,6 @@ class SnapshotPluginBuilder:
 
             self._out_file_path = snapshot_plugin_dir
             self._interim_file_path = snapshot_plugin_dir
-            self._storage = get_storage_async()  # from foglamp.services.core.connect
         except (OSError, Exception) as ex:
             _LOGGER.error("Error in initializing SnapshotPluginBuilder class: %s ", str(ex))
             raise RuntimeError(str(ex))
@@ -89,8 +85,9 @@ class SnapshotPluginBuilder:
 
     def extract_files(self, pyz):
         try:
-            with tarfile.open(pyz, "r") as tar:
-                tar.extractall()
+            with tarfile.open(pyz, "r:gz") as tar:
+                # Since we are storing full path of the files, we need to specify "/" as the path to restore
+                tar.extractall(path="/", members=tar.getmembers())
         except Exception as ex:
             raise RuntimeError("Extraction error for snapshot {}. {}".format(pyz, str(ex)))
         else:
