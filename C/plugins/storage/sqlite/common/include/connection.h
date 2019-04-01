@@ -33,6 +33,11 @@
 // Maximum no. of retries for a DB lock
 #define MAX_RETRIES 10
 
+// Set plugin name for log messages
+#ifndef PLUGIN_LOG_NAME
+#define PLUGIN_LOG_NAME "SQLite3"
+#endif
+
 int dateCallback(void *data, int nCols, char **colValues, char **colNames);
 bool applyColumnDateFormat(const std::string& inFormat,
 			   const std::string& colName,

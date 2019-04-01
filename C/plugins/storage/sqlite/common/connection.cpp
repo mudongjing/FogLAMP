@@ -29,10 +29,6 @@
 #define PURGE_SLOWDOWN_AFTER_BLOCKS 5
 #define PURGE_SLOWDOWN_SLEEP_MS 500
 
-#ifndef PLUGIN_LOG_NAME
-#define PLUGIN_LOG_NAME "SQLite 3"
-#endif
-
 /**
  * SQLite3 storage plugin for FogLAMP
  */
@@ -108,7 +104,6 @@ int dateCallback(void *data,
 	}
 }
 
-#ifdef PIPPO
 /**
  * Apply FogLAMP default datetime formatting
  * to a detected DATETIME datatype column
@@ -237,7 +232,6 @@ bool Connection::applyColumnDateTimeFormat(sqlite3_stmt *pStmt,
 
 	return false;
 }
-#endif
 
 /**
  * Apply the specified date format
@@ -527,7 +521,6 @@ void Connection::setTrace(bool flag)
 	m_logSQL = flag;
 }
 
-#ifdef PIPPO
 /**
  * Map a SQLite3 result set to a string version of a JSON document
  *
@@ -669,7 +662,6 @@ unsigned long nRows = 0, nCols = 0;
 	// Return SQLite3 ret code
 	return rc;
 }
-#endif
 
 /**
  * This SQLIte3 query callback just returns the number of rows seen
@@ -2522,7 +2514,6 @@ char *ptr;
 	return str;
 }
 
-#ifndef SQLITE_SPLIT_READINGS
 /**
  * Raise an error to return from the plugin
  */
@@ -2535,10 +2526,12 @@ char	tmpbuf[512];
 	va_start(ap, reason);
 	vsnprintf(tmpbuf, sizeof(tmpbuf), reason, ap);
 	va_end(ap);
-	Logger::getLogger()->error("SQLite3 storage plugin raising error: %s", tmpbuf);
+	Logger::getLogger()->error("%s storage plugin raising error: %s",
+				   PLUGIN_LOG_NAME,
+				   tmpbuf);
 	manager->setError(operation, tmpbuf, false);
 }
-#endif
+
 /**
  * Return the sie of a given table in bytes
  */
@@ -2747,3 +2740,80 @@ int retries = 0, rc;
 
 	return rc;
 }
+
+#ifndef SQLITE_SPLIT_READINGS
+/**
+ * Perform a delete against a common table
+ *
+ */
+int Connection::deleteRows(const string& table, const string& condition)
+{
+// Default template parameter uses UTF8 and MemoryPoolAllocator.
+Document document;
+SQLBuffer	sql;
+ 
+	sql.append("DELETE FROM foglamp.");
+	sql.append(table);
+	if (! condition.empty())
+	{
+		sql.append(" WHERE ");
+		if (document.Parse(condition.c_str()).HasParseError())
+		{
+			raiseError("delete", "Failed to parse JSON payload");
+			return -1;
+		}
+		else
+		{
+			if (document.HasMember("where"))
+			{
+				if (!jsonWhereClause(document["where"], sql))
+				{
+					return -1;
+				}
+			}
+			else
+			{
+				raiseError("delete",
+					   "JSON does not contain where clause");
+				return -1;
+			}
+		}
+	}
+	sql.append(';');
+
+	const char *query = sql.coalesce();
+	logSQL("CommonDelete", query);
+	char *zErrMsg = NULL;
+	int delete_rows;
+	int rc;
+
+	// Exec the DELETE statement: no callback, no result set
+	m_writeAccessOngoing.fetch_add(1);
+	rc = SQLexec(dbHandle,
+		     query,
+		     NULL,
+		     NULL,
+		     &zErrMsg);
+	m_writeAccessOngoing.fetch_sub(1);
+	if (m_writeAccessOngoing == 0)
+		db_cv.notify_all();
+
+	// Check result code
+	if (rc == SQLITE_OK)
+	{
+		// Success. Release memory for 'query' var
+		delete[] query;
+        	return sqlite3_changes(dbHandle);
+	}
+	else
+	{
+ 		raiseError("delete", zErrMsg);
+		sqlite3_free(zErrMsg);
+		Logger::getLogger()->error("SQL statement: %s", query);
+		delete[] query;
+
+		// Failure
+		return -1;
+	}
+}
+#endif
