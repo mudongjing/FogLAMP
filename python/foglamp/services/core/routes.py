@@ -23,6 +23,7 @@ from foglamp.services.core.api import south
 from foglamp.services.core.api import north
 from foglamp.services.core.api import filters
 from foglamp.services.core.api import notification
+from foglamp.services.core.api import snapshot_plugin
 
 
 __author__ = "Ashish Jabble, Praveen Garg, Massimiliano Pinto"
@@ -174,6 +175,12 @@ def setup(app):
     app.router.add_route('POST', '/foglamp/notification', notification.post_notification)
     app.router.add_route('PUT', '/foglamp/notification/{notification_name}', notification.put_notification)
     app.router.add_route('DELETE', '/foglamp/notification/{notification_name}', notification.delete_notification)
+
+    # Snapshot plugins
+    app.router.add_route('GET', '/foglamp/plugins/snapshot', snapshot_plugin.get_snapshot)
+    app.router.add_route('POST', '/foglamp/plugins/snapshot', snapshot_plugin.post_snapshot)
+    app.router.add_route('PUT', '/foglamp/plugins/snapshot/{id}', snapshot_plugin.put_snapshot)
+    app.router.add_route('DELETE', '/foglamp/plugins/snapshot/{id}', snapshot_plugin.delete_snapshot)
 
     # enable cors support
     enable_cors(app)
