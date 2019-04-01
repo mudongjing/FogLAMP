@@ -30,9 +30,6 @@
 #define SQLITE3_NOW_READING     "strftime('%Y-%m-%d %H:%M:%f000+00:00', 'now')"
 #define SQLITE3_FOGLAMP_DATETIME_TYPE "DATETIME"
 
-// Maximum no. of retries for a DB lock
-#define MAX_RETRIES 10
-
 // Set plugin name for log messages
 #ifndef PLUGIN_LOG_NAME
 #define PLUGIN_LOG_NAME "SQLite3"
