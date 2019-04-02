@@ -60,12 +60,10 @@ async def put_snapshot(request):
     """extract a snapshot
 
     :Example:
-        curl -X PUT http://localhost:8081/foglamp/plugins/snapshot/snapshot-180311-18-03-36.tar.gz
+        curl -X PUT http://localhost:8081/foglamp/plugins/snapshot/1554204238
     """
-    snapshot_name = request.match_info.get('id', None)
-
-    if not str(snapshot_name).endswith('.tar.gz'):
-        return web.HTTPBadRequest(reason="Snapshot file extension is invalid")
+    snapshot_id = request.match_info.get('id', None)
+    snapshot_name = "snapshot-plugin-{}.tar.gz".format(snapshot_id)
 
     if not os.path.isdir(_get_snapshot_dir()):
         raise web.HTTPNotFound(reason="Snapshot directory does not exist")
@@ -88,12 +86,10 @@ async def delete_snapshot(request):
     """delete a snapshot
 
     :Example:
-        curl -X DELETE http://localhost:8081/foglamp/plugins/snapshot/snapshot-180311-18-03-36.tar.gz
+        curl -X DELETE http://localhost:8081/foglamp/plugins/snapshot/1554204238
     """
-    snapshot_name = request.match_info.get('id', None)
-
-    if not str(snapshot_name).endswith('.tar.gz'):
-        return web.HTTPBadRequest(reason="Snapshot file extension is invalid")
+    snapshot_id = request.match_info.get('id', None)
+    snapshot_name = "snapshot-plugin-{}.tar.gz".format(snapshot_id)
 
     if not os.path.isdir(_get_snapshot_dir()):
         raise web.HTTPNotFound(reason="Snapshot directory does not exist")
@@ -114,7 +110,7 @@ async def delete_snapshot(request):
 
 def _get_snapshot_dir():
     if _FOGLAMP_DATA:
-        snapshot_dir = os.path.expanduser(_FOGLAMP_DATA + '/tmp/snapshot')
+        snapshot_dir = os.path.expanduser(_FOGLAMP_DATA + '/snapshots/plugins')
     else:
-        snapshot_dir = os.path.expanduser(_FOGLAMP_ROOT + '/data/tmp/snapshot')
+        snapshot_dir = os.path.expanduser(_FOGLAMP_ROOT + '/data/snapshots/plugins')
     return snapshot_dir

@@ -13,6 +13,8 @@ import glob
 import json
 import tarfile
 import fnmatch
+import time
+
 from foglamp.common import logger
 from foglamp.common.common import _FOGLAMP_ROOT
 
@@ -46,9 +48,8 @@ class SnapshotPluginBuilder:
 
     async def build(self):
         try:
-            today = datetime.datetime.now()
-            file_spec = today.strftime('%y%m%d-%H-%M-%S')
-            tar_file_name = self._out_file_path+"/"+"snapshot-plugin-{}.tar.gz".format(file_spec)
+            snapshot_id = str(int(time.time()))
+            tar_file_name = self._out_file_path+"/"+"snapshot-plugin-{}.tar.gz".format(snapshot_id)
             pyz = tarfile.open(tar_file_name, "w:gz")
             foglamp_dir = _FOGLAMP_ROOT.split("/python")[0]
             try:
