@@ -284,7 +284,7 @@ bool Connection::applyColumnDateTimeFormat(sqlite3_stmt *pStmt,
  * using the available formats in SQLite3
  * for a specific column
  *
- * If the requested format is not availble
+ * If the requested format is not available
  * the input column is used as is.
  * Additionally milliseconds could be rounded
  * upon request.
