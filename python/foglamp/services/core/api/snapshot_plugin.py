@@ -53,7 +53,7 @@ async def post_snapshot(request):
     except Exception as ex:
         raise web.HTTPInternalServerError(reason='Support could not be created. {}'.format(str(ex)))
     else:
-        return web.json_response({"snapshot created": snapshot_name})
+        return web.json_response({"message": "snapshot {} created successfully.".format(snapshot_name)})
 
 
 async def put_snapshot(request):
@@ -81,7 +81,7 @@ async def put_snapshot(request):
     except Exception as ex:
         raise web.HTTPInternalServerError(reason='Snapshot {} could not be restored. {}'.format(snapshot_name, str(ex)))
     else:
-        return web.json_response({"snapshot restored successfully": snapshot_name})
+        return web.json_response({"message": "snapshot {} restored successfully.".format(snapshot_name)})
 
 
 async def delete_snapshot(request):
@@ -109,7 +109,7 @@ async def delete_snapshot(request):
     except Exception as ex:
         raise web.HTTPInternalServerError(reason='Snapshot {} could not be deleted. {}'.format(snapshot_name, str(ex)))
     else:
-        return web.json_response({"snapshot deleted successfully": snapshot_name})
+        return web.json_response({"message": "snapshot {} deleted successfully.".format(snapshot_name)})
 
 
 def _get_snapshot_dir():
