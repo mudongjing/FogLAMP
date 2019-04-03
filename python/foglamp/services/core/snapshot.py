@@ -51,10 +51,12 @@ class SnapshotPluginBuilder:
             snapshot_id = str(int(time.time()))
             tar_file_name = self._out_file_path+"/"+"snapshot-plugin-{}.tar.gz".format(snapshot_id)
             pyz = tarfile.open(tar_file_name, "w:gz")
-            foglamp_dir = _FOGLAMP_ROOT.split("/python")[0]
             try:
-                pyz.add("{}/python/foglamp/plugins".format(foglamp_dir), recursive=True)
-                pyz.add("{}/C/plugins".format(foglamp_dir), recursive=True)
+                pyz.add("{}/python/foglamp/plugins".format(_FOGLAMP_ROOT), recursive=True)
+                if _FOGLAMP_ROOT == '/usr/local/foglamp':
+                    pyz.add("{}/plugins".format(_FOGLAMP_ROOT), recursive=True)
+                else:
+                    pyz.add("{}/C/plugins".format(_FOGLAMP_ROOT), recursive=True)
             finally:
                 pyz.close()
         except Exception as ex:

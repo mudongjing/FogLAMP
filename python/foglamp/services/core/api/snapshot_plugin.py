@@ -51,7 +51,7 @@ async def post_snapshot(request):
     try:
         snapshot_name = await SnapshotPluginBuilder(snapshot_dir).build()
     except Exception as ex:
-        raise web.HTTPInternalServerError(reason='Support could not be created. {}'.format(str(ex)))
+        raise web.HTTPInternalServerError(reason='Snapshot could not be created. {}'.format(str(ex)))
     else:
         return web.json_response({"message": "snapshot {} created successfully.".format(snapshot_name)})
 
