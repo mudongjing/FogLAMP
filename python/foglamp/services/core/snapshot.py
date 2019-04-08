@@ -20,7 +20,7 @@ from foglamp.common.common import _FOGLAMP_ROOT
 
 
 __author__ = "Amarendra K Sinha"
-__copyright__ = "Copyright (c) 2017 OSIsoft, LLC"
+__copyright__ = "Copyright (c) 2019 Dianomic Systems"
 __license__ = "Apache 2.0"
 __version__ = "${VERSION}"
 
@@ -38,7 +38,7 @@ class SnapshotPluginBuilder:
             if not os.path.exists(snapshot_plugin_dir):
                 os.makedirs(snapshot_plugin_dir)
             else:
-                self.check_and_delete_bundles(snapshot_plugin_dir)
+                self.check_and_delete_plugins_tar_files(snapshot_plugin_dir)
 
             self._out_file_path = snapshot_plugin_dir
             self._interim_file_path = snapshot_plugin_dir
@@ -49,10 +49,12 @@ class SnapshotPluginBuilder:
     async def build(self):
         try:
             snapshot_id = str(int(time.time()))
-            tar_file_name = self._out_file_path+"/"+"snapshot-plugin-{}.tar.gz".format(snapshot_id)
+            snapshot_filename = "snapshot-plugin-{}.tar.gz".format(snapshot_id)
+            tar_file_name = "{}/{}".format(self._out_file_path, snapshot_filename)
             pyz = tarfile.open(tar_file_name, "w:gz")
             try:
                 pyz.add("{}/python/foglamp/plugins".format(_FOGLAMP_ROOT), recursive=True)
+                # C plugins location is different with "make install" and "make"
                 if _FOGLAMP_ROOT == '/usr/local/foglamp':
                     pyz.add("{}/plugins".format(_FOGLAMP_ROOT), recursive=True)
                 else:
@@ -64,10 +66,10 @@ class SnapshotPluginBuilder:
             raise RuntimeError(str(ex))
 
         self.check_and_delete_temp_files(self._interim_file_path)
-        _LOGGER.info("Snapshot bundle %s successfully created.", tar_file_name)
-        return tar_file_name
+        _LOGGER.info("Snapshot %s successfully created.", tar_file_name)
+        return snapshot_id, snapshot_filename
 
-    def check_and_delete_bundles(self, snapshot_plugin_dir):
+    def check_and_delete_plugins_tar_files(self, snapshot_plugin_dir):
         files = glob.glob(snapshot_plugin_dir + "/" + "snapshot-plugin*.tar.gz")
         files.sort(key=os.path.getmtime)
         if len(files) >= _NO_OF_FILES_TO_RETAIN:

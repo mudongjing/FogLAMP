@@ -12,15 +12,15 @@ from foglamp.common.common import _FOGLAMP_ROOT, _FOGLAMP_DATA
 
 
 __author__ = "Amarendra K Sinha"
-__copyright__ = "Copyright (c) 2017 OSIsoft, LLC"
+__copyright__ = "Copyright (c) 2019 Diaonmic Systems"
 __license__ = "Apache 2.0"
 __version__ = "${VERSION}"
 
 
 _help = """
     -------------------------------------------------------------------------------
-    | GET POST        | /foglamp/plugins/snapshot                                 |
-    | PUT DELETE      | /foglamp/plugins/snapshot/{id}                            |
+    | GET POST        | /foglamp/snapshot/plugins                                 |
+    | PUT DELETE      | /foglamp/snapshot/plugins/{id}                    |
     -------------------------------------------------------------------------------
 """
 
@@ -35,8 +35,10 @@ async def get_snapshot(request):
     snapshot_dir = _get_snapshot_dir()
     valid_extension = '.tar.gz'
     found_files = []
+    find_id = lambda x: x.split("snapshot-plugin-")[1].split(".tar.gz")[0]
+
     for root, dirs, files in os.walk(snapshot_dir):
-        found_files = [f for f in files if f.endswith(valid_extension)]
+        found_files = [{"id": find_id(f), "name":f} for f in files if f.endswith(valid_extension)]
 
     return web.json_response({"snapshots": found_files})
 
@@ -49,11 +51,11 @@ async def post_snapshot(request):
     """
     snapshot_dir = _get_snapshot_dir()
     try:
-        snapshot_name = await SnapshotPluginBuilder(snapshot_dir).build()
+        snapshot_id, snapshot_name = await SnapshotPluginBuilder(snapshot_dir).build()
     except Exception as ex:
         raise web.HTTPInternalServerError(reason='Snapshot could not be created. {}'.format(str(ex)))
     else:
-        return web.json_response({"message": "snapshot {} created successfully.".format(snapshot_name)})
+        return web.json_response({"message": "snapshot id={}, file={} created successfully.".format(snapshot_id, snapshot_name)})
 
 
 async def put_snapshot(request):
@@ -66,7 +68,7 @@ async def put_snapshot(request):
     snapshot_name = "snapshot-plugin-{}.tar.gz".format(snapshot_id)
 
     if not os.path.isdir(_get_snapshot_dir()):
-        raise web.HTTPNotFound(reason="Snapshot directory does not exist")
+        raise web.HTTPNotFound(reason="No snapshot found.")
 
     snapshot_dir = _get_snapshot_dir()
     for root, dirs, files in os.walk(snapshot_dir):
@@ -92,7 +94,7 @@ async def delete_snapshot(request):
     snapshot_name = "snapshot-plugin-{}.tar.gz".format(snapshot_id)
 
     if not os.path.isdir(_get_snapshot_dir()):
-        raise web.HTTPNotFound(reason="Snapshot directory does not exist")
+        raise web.HTTPNotFound(reason="No snapshot found.")
 
     snapshot_dir = _get_snapshot_dir()
     for root, dirs, files in os.walk(_get_snapshot_dir()):
