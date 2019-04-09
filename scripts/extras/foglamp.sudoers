@@ -1,2 +1,3 @@
-%sudo ALL=(ALL) NOPASSWD: /usr/bin/apt-get -y update, /usr/bin/apt-get -y install foglamp
-
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/apt-get -y update
+%sudo ALL=(ALL) NOPASSWD: /usr/bin/apt-get -y install foglamp
+%sudo ALL=(ALL) NOPASSWD: /bin/tar -C / -xzf *

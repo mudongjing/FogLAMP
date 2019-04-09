@@ -14,6 +14,7 @@ import json
 import tarfile
 import fnmatch
 import time
+import subprocess
 
 from foglamp.common import logger
 from foglamp.common.common import _FOGLAMP_ROOT
@@ -47,6 +48,10 @@ class SnapshotPluginBuilder:
             raise RuntimeError(str(ex))
 
     async def build(self):
+        def reset(tarinfo):
+            tarinfo.uid = tarinfo.gid = 0
+            tarinfo.uname = tarinfo.gname = "root"
+            return tarinfo
         try:
             snapshot_id = str(int(time.time()))
             snapshot_filename = "snapshot-plugin-{}.tar.gz".format(snapshot_id)
@@ -56,7 +61,7 @@ class SnapshotPluginBuilder:
                 pyz.add("{}/python/foglamp/plugins".format(_FOGLAMP_ROOT), recursive=True)
                 # C plugins location is different with "make install" and "make"
                 if _FOGLAMP_ROOT == '/usr/local/foglamp':
-                    pyz.add("{}/plugins".format(_FOGLAMP_ROOT), recursive=True)
+                    pyz.add("{}/plugins".format(_FOGLAMP_ROOT), recursive=True, filter=reset)
                 else:
                     pyz.add("{}/C/plugins".format(_FOGLAMP_ROOT), recursive=True)
             finally:
@@ -89,11 +94,24 @@ class SnapshotPluginBuilder:
         pyz.add(temp_file, arcname=basename(temp_file))
 
     def extract_files(self, pyz):
-        try:
-            with tarfile.open(pyz, "r:gz") as tar:
-                # Since we are storing full path of the files, we need to specify "/" as the path to restore
-                tar.extractall(path="/", members=tar.getmembers())
-        except Exception as ex:
-            raise RuntimeError("Extraction error for snapshot {}. {}".format(pyz, str(ex)))
+        # Since we are storing full path of the files, we need to specify "/" as the path to restore
+        if _FOGLAMP_ROOT == '/usr/local/foglamp':
+            a = subprocess.Popen(["sudo", "/bin/tar", "-C", "/", "-xzf", pyz], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         else:
-            return True
+            a = subprocess.Popen(["/bin/tar", "-C", "/", "-xzf", pyz], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        outs, errs = a.communicate()
+        retcode = a.returncode
+        if retcode != 0:
+            raise OSError(
+                'Error {}: "{}". Error: {}'.format(retcode, "tar -xzf {} -C /".format(pyz), errs.decode('utf-8').replace('\n', '')))
+        return True
+
+        # TODO: Investigate why below does not work with sudo make install
+        # try:
+        #     with tarfile.open(pyz, "r:gz") as tar:
+        #         # Since we are storing full path of the files, we need to specify "/" as the path to restore
+        #         tar.extractall(path="/", members=tar.getmembers())
+        # except Exception as ex:
+        #     raise RuntimeError("Extraction error for snapshot {}. {}".format(pyz, str(ex)))
+        # else:
+        #     return True
