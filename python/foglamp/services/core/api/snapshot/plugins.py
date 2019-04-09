@@ -12,7 +12,7 @@ from foglamp.common.common import _FOGLAMP_ROOT, _FOGLAMP_DATA
 
 
 __author__ = "Amarendra K Sinha"
-__copyright__ = "Copyright (c) 2019 Diaonmic Systems"
+__copyright__ = "Copyright (c) 2019 Dianomic Systems"
 __license__ = "Apache 2.0"
 __version__ = "${VERSION}"
 
