@@ -4,9 +4,8 @@
 # See: http://foglamp.readthedocs.io/
 # FOGLAMP_END
 
-""" Provides utility functions to take snapshot of Foglamp"""
+""" Provides utility functions to take snapshot of plugins"""
 
-import datetime
 import os
 from os.path import basename
 import glob

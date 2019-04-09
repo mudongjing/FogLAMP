@@ -20,7 +20,7 @@ __version__ = "${VERSION}"
 _help = """
     -------------------------------------------------------------------------------
     | GET POST        | /foglamp/snapshot/plugins                                 |
-    | PUT DELETE      | /foglamp/snapshot/plugins/{id}                    |
+    | PUT DELETE      | /foglamp/snapshot/plugins/{id}                            |
     -------------------------------------------------------------------------------
 """
 
@@ -77,7 +77,7 @@ async def put_snapshot(request):
 
     try:
         p = "{}/{}".format(snapshot_dir, snapshot_name)
-        retval = SnapshotPluginBuilder(snapshot_dir).extract_files(p)
+        SnapshotPluginBuilder(snapshot_dir).extract_files(p)
     except Exception as ex:
         raise web.HTTPInternalServerError(reason='Snapshot {} could not be restored. {}'.format(snapshot_name, str(ex)))
     else:
