@@ -29,7 +29,7 @@ async def get_snapshot(request):
     """ get list of available snapshots
 
     :Example:
-        curl -X GET http://localhost:8081/foglamp/plugins/snapshot
+        curl -X GET http://localhost:8081/foglamp/snapshot/plugins
     """
     # Get snapshot directory path
     snapshot_dir = _get_snapshot_dir()
@@ -47,7 +47,7 @@ async def post_snapshot(request):
     """ Create a snapshot  by name
 
     :Example:
-        curl -X POST http://localhost:8081/foglamp/plugins/snapshot
+        curl -X POST http://localhost:8081/foglamp/snapshot/plugins
     """
     snapshot_dir = _get_snapshot_dir()
     try:
@@ -62,7 +62,7 @@ async def put_snapshot(request):
     """extract a snapshot
 
     :Example:
-        curl -X PUT http://localhost:8081/foglamp/plugins/snapshot/1554204238
+        curl -X PUT http://localhost:8081/foglamp/snapshot/plugins/1554204238
     """
     snapshot_id = request.match_info.get('id', None)
     snapshot_name = "snapshot-plugin-{}.tar.gz".format(snapshot_id)
@@ -88,7 +88,7 @@ async def delete_snapshot(request):
     """delete a snapshot
 
     :Example:
-        curl -X DELETE http://localhost:8081/foglamp/plugins/snapshot/1554204238
+        curl -X DELETE http://localhost:8081/foglamp/snapshot/plugins/1554204238
     """
     snapshot_id = request.match_info.get('id', None)
     snapshot_name = "snapshot-plugin-{}.tar.gz".format(snapshot_id)
