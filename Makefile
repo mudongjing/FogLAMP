@@ -96,6 +96,8 @@ BACKUP_SRC                  := scripts/tasks/backup
 RESTORE_SRC                 := scripts/tasks/restore
 CHECK_CERTS_TASK_SCRIPT_SRC := scripts/tasks/check_certs
 CERTIFICATES_SCRIPT_SRC     := scripts/certificates
+RESTORE_PLUGINS_SCRIPT_SRC  := scripts/restore_plugins_snapshot
+RESTORE_PLUGINS_SCRIPT      := restore_plugins_snapshot
 PACKAGE_UPDATE_SCRIPT_SRC   := scripts/package
 
 # EXTRA SCRIPTS
@@ -289,6 +291,7 @@ scripts_install : $(SCRIPTS_INSTALL_DIR) \
 	install_restore_script \
 	install_check_certificates_script \
 	install_certificates_script \
+	install_restore_plugins_script \
 	install_package_update_script
 
 # create scripts install dir
@@ -351,6 +354,11 @@ install_storage_script : $(SCRIPT_INSTALL_DIR) $(STORAGE_SCRIPT_SRC)
 
 install_certificates_script : $(SCRIPT_INSTALL_DIR) $(CERTIFICATES_SCRIPT_SRC)
 	$(CP) $(CERTIFICATES_SCRIPT_SRC) $(SCRIPTS_INSTALL_DIR)
+
+install_restore_plugins_script : $(SCRIPT_INSTALL_DIR) $(RESTORE_PLUGINS_SCRIPT_SRC)
+	$(CP) $(RESTORE_PLUGINS_SCRIPT_SRC) $(SCRIPTS_INSTALL_DIR)
+	chmod u+s $(SCRIPTS_INSTALL_DIR)/$(RESTORE_PLUGINS_SCRIPT)
+	chmod g+s $(SCRIPTS_INSTALL_DIR)/$(RESTORE_PLUGINS_SCRIPT)
 
 install_package_update_script : $(SCRIPT_INSTALL_DIR) $(PACKAGE_UPDATE_SCRIPT_SRC)
 	$(CP_DIR) $(PACKAGE_UPDATE_SCRIPT_SRC) $(SCRIPTS_INSTALL_DIR)

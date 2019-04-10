@@ -96,15 +96,16 @@ class SnapshotPluginBuilder:
 
     def extract_files(self, pyz):
         # Since we are storing full path of the files, we need to specify "/" as the path to restore
-        if _FOGLAMP_ROOT == '/usr/local/foglamp':
-            a = subprocess.Popen(["sudo", "/bin/tar", "-C", "/", "-xzf", pyz], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        else:
-            a = subprocess.Popen(["/bin/tar", "-C", "/", "-xzf", pyz], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # if _FOGLAMP_ROOT == '/usr/local/foglamp':
+        #     a = subprocess.Popen(["{}/restore_plugins_snapshot".format(_FOGLAMP_ROOT), pyz], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # else:
+        a = subprocess.Popen(["{}/scripts/restore_plugins_snapshot".format(_FOGLAMP_ROOT), pyz], shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         outs, errs = a.communicate()
         retcode = a.returncode
         if retcode != 0:
             raise OSError(
-                'Error {}: "{}". Error: {}'.format(retcode, "tar -xzf {} -C /".format(pyz), errs.decode('utf-8').replace('\n', '')))
+                'Error {}: "{}". Error: {}'.format(retcode, "tar -xzf {} -C /".format(pyz), errs.decode('utf-8').replace('\n',
+                                                                                                                         '')))
         return True
 
         # TODO: Investigate why below does not work with sudo make install
