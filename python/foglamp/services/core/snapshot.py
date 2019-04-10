@@ -26,7 +26,7 @@ __version__ = "${VERSION}"
 
 _LOGGER = logger.setup(__name__)
 _NO_OF_FILES_TO_RETAIN = 3
-
+SNAPSHOT_PREFIX = "snapshot-plugin"
 
 class SnapshotPluginBuilder:
 
@@ -53,7 +53,7 @@ class SnapshotPluginBuilder:
             return tarinfo
         try:
             snapshot_id = str(int(time.time()))
-            snapshot_filename = "snapshot-plugin-{}.tar.gz".format(snapshot_id)
+            snapshot_filename = "{}-{}.tar.gz".format(SNAPSHOT_PREFIX, snapshot_id)
             tar_file_name = "{}/{}".format(self._out_file_path, snapshot_filename)
             pyz = tarfile.open(tar_file_name, "w:gz")
             try:
@@ -63,6 +63,8 @@ class SnapshotPluginBuilder:
                     pyz.add("{}/plugins".format(_FOGLAMP_ROOT), recursive=True, filter=reset)
                 else:
                     pyz.add("{}/C/plugins".format(_FOGLAMP_ROOT), recursive=True)
+                    pyz.add("{}/plugins".format(_FOGLAMP_ROOT), recursive=True)
+                    pyz.add("{}/cmake_build/C/plugins".format(_FOGLAMP_ROOT), recursive=True)
             finally:
                 pyz.close()
         except Exception as ex:
@@ -74,7 +76,7 @@ class SnapshotPluginBuilder:
         return snapshot_id, snapshot_filename
 
     def check_and_delete_plugins_tar_files(self, snapshot_plugin_dir):
-        files = glob.glob(snapshot_plugin_dir + "/" + "snapshot-plugin*.tar.gz")
+        files = glob.glob("{}/{}*.tar.gz".format(snapshot_plugin_dir, SNAPSHOT_PREFIX))
         files.sort(key=os.path.getmtime)
         if len(files) >= _NO_OF_FILES_TO_RETAIN:
             for f in files[:-2]:
@@ -84,7 +86,7 @@ class SnapshotPluginBuilder:
     def check_and_delete_temp_files(self, snapshot_plugin_dir):
         # Delete all non *.tar.gz files
         for f in os.listdir(snapshot_plugin_dir):
-            if not fnmatch.fnmatch(f, 'snapshot-plugin*.tar.gz'):
+            if not fnmatch.fnmatch(f, '{}*.tar.gz'.format(SNAPSHOT_PREFIX)):
                 os.remove(os.path.join(snapshot_plugin_dir, f))
 
     def write_to_tar(self, pyz, temp_file, data):

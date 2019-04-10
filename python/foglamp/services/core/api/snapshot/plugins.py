@@ -38,7 +38,7 @@ async def get_snapshot(request):
     find_id = lambda x: x.split("snapshot-plugin-")[1].split(".tar.gz")[0]
 
     for root, dirs, files in os.walk(snapshot_dir):
-        found_files = [{"id": find_id(f), "name":f} for f in files if f.endswith(valid_extension)]
+        found_files = [{"id": find_id(f), "name": f} for f in files if f.endswith(valid_extension)]
 
     return web.json_response({"snapshots": found_files})
 
